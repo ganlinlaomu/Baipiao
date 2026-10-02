@@ -3,7 +3,7 @@ export type AppType = 'web' | 'native' | 'service';
 
 export interface Env {
   RELAY: DurableObjectNamespace<import('./relay-object').RelayDurableObject>;
-  ADMIN_TOKEN: string;
+  ADMIN_TOKEN?: string;
 }
 
 export interface NostrEvent {
