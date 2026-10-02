@@ -22,12 +22,12 @@ The project is intentionally application-neutral. It is not tied to any Nostr cl
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ganlinlaomu/cloudflare-nostr-relay)
 
-Cloudflare reads `wrangler.jsonc`, provisions the SQLite-backed Durable Object, asks for the required `ADMIN_TOKEN` secret, builds the Worker, and deploys it.
+Cloudflare reads `wrangler.jsonc`, provisions the SQLite-backed Durable Object, and detects `ADMIN_TOKEN` from `.dev.vars.example` as a Worker secret. Enter a long random value for it on the deployment setup screen, then deploy.
 
 After deployment:
 
 1. Open `https://<your-worker>.workers.dev/admin`.
-2. Enter the `ADMIN_TOKEN` you configured during deployment.
+2. Enter the same `ADMIN_TOKEN` you configured on the Cloudflare deployment setup screen.
 3. Configure read/write policy.
 4. Add your first application and copy its token. The raw token is shown only once.
 5. Optionally add Nostr users by `npub` or hex pubkey.
@@ -145,8 +145,11 @@ npm run check
 Deploy manually:
 
 ```bash
+npx wrangler secret put ADMIN_TOKEN
 npm run deploy
 ```
+
+If you already attempted a Deploy to Cloudflare deployment before this fix and the build stopped with `required secrets have not been set: ADMIN_TOKEN`, restart the deployment from the current `main` branch. The current template lets the Deploy Button supply the secret during setup instead of making Wrangler validate a pre-existing Worker secret.
 
 ## Architecture
 
