@@ -1,0 +1,2 @@
+# Required. Choose a long random value before local development or deployment.
+ADMIN_TOKEN=replace-with-a-long-random-admin-token
