@@ -18,9 +18,6 @@
       "storage": "sqlite"
     }
   },
-  "secrets": {
-    "required": ["ADMIN_TOKEN"]
-  },
   "observability": {
     "enabled": true
   }
