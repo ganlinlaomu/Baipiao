@@ -46,7 +46,7 @@ export function normalizePubkey(input: string): string | null {
   if (HEX_32.test(value)) return value;
   if (!value.startsWith('npub1')) return null;
   try {
-    const decoded = bech32.decode(value, 1000);
+    const decoded = bech32.decode(value as `${string}1${string}`, 1000);
     if (decoded.prefix !== 'npub') return null;
     const bytes = bech32.fromWords(decoded.words);
     if (bytes.length !== 32) return null;
