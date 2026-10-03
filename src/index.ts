@@ -72,6 +72,12 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/admin/')) {
+      if (!env.ADMIN_TOKEN) {
+        return new Response(JSON.stringify({ error: 'ADMIN_TOKEN is not configured on this Worker. Add the secret in Cloudflare Workers settings, then redeploy.' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       if (!(await isAdmin(request, env))) {
         return new Response(JSON.stringify({ error: 'unauthorized' }), {
           status: 401,
