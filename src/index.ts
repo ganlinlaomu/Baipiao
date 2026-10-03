@@ -1,4 +1,4 @@
-import { adminHtml } from './admin-ui';
+import { adminHtml, adminScript } from './admin-ui';
 import { sha256Hex } from './nostr';
 import { RelayDurableObject } from './relay-object';
 import type { Env } from './types';
@@ -64,9 +64,19 @@ export default {
         headers: {
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
-          'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+          'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
           'x-frame-options': 'DENY',
           'referrer-policy': 'no-referrer',
+        },
+      });
+    }
+
+    if (url.pathname === '/admin.js' && request.method === 'GET') {
+      return new Response(adminScript(), {
+        headers: {
+          'content-type': 'text/javascript; charset=utf-8',
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
         },
       });
     }
