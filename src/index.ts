@@ -81,6 +81,10 @@ export default {
       });
     }
 
+    if (url.pathname === '/api/app/session' && request.method === 'POST') {
+      return stub.fetch(request);
+    }
+
     if (url.pathname.startsWith('/api/admin/')) {
       if (!env.ADMIN_TOKEN) {
         return new Response(JSON.stringify({ error: 'ADMIN_TOKEN is not configured on this Worker. Add the secret in Cloudflare Workers settings, then redeploy.' }), {

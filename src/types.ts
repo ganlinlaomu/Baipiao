@@ -70,6 +70,8 @@ export interface SessionAttachment {
   challenge: string;
   relay_host: string;
   app_id: string | null;
+  app_session_expires_at: number | null;
+  app_session_pubkey: string | null;
   authenticated_pubkeys: string[];
   subscriptions: Record<string, NostrFilter[]>;
   rate_window_started_at: number;

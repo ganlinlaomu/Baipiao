@@ -51,36 +51,38 @@ This lets the owner's approved app write to the relay while also allowing indivi
 
 ## Application authentication
 
-Creating an application in `/admin` returns an opaque token such as:
+Creating an application in `/admin` returns a long-lived **server-side application credential** such as:
 
 ```text
 nra_...
 ```
 
-Only a SHA-256 hash of this token is stored by the relay.
+Only a SHA-256 hash of this credential is stored by the relay. Do **not** embed the `nra_...` credential in browser/PWA JavaScript and do not use it directly as a WebSocket credential.
 
-### Native/server clients
-
-When the client can set WebSocket upgrade headers:
+A trusted backend exchanges it for a short-lived relay session:
 
 ```http
+POST /api/app/session
 Authorization: Bearer nra_...
+Content-Type: application/json
+
+{"subject":"<optional 64-char nostr pubkey>","ttl":600}
 ```
 
-### Browser/PWA clients
+The response contains a short-lived `nrs_...` session token. If `subject` is supplied, that verified user identity is bound to the session for the session lifetime.
 
-Browser WebSocket APIs cannot set an `Authorization` header. Pass the token as a WebSocket subprotocol:
+Browser/PWA clients then connect with the short-lived token:
 
 ```js
 const ws = new WebSocket('wss://relay.example.com', [
   'nostr',
-  `relay-app.${APP_TOKEN}`,
+  `relay-app.${SHORT_LIVED_SESSION_TOKEN}`,
 ]);
 ```
 
-The relay selects the `nostr` subprotocol while using the `relay-app.*` value only for access control.
+Native/server clients may alternatively send the same short-lived session token as `Authorization: Bearer nrs_...` during the WebSocket upgrade.
 
-**Security note:** a secret embedded in public browser JavaScript cannot be treated as a confidential application credential. For `web` applications the relay can additionally restrict the token to exact allowed Origins. This raises the bar for casual reuse, but it is not cryptographic app attestation. Native apps can later add platform attestation outside the Nostr protocol if stronger app identity is required.
+For `web` applications, configured allowed Origins are still checked on the WebSocket upgrade. The long-lived application credential remains server-side; the browser only receives an expiring capability.
 
 ## User authentication
 
@@ -179,6 +181,7 @@ SQLite tables are created automatically inside the Durable Object:
 - `events`
 - `event_tags`
 - `applications`
+- `app_sessions`
 - `users`
 - `settings`
 

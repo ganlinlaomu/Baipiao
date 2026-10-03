@@ -47,6 +47,12 @@ const encoder = new TextEncoder();
 
 type SqlRow = Record<string, SqlStorageValue>;
 
+type AppSessionGrant = {
+  app: AppRecord;
+  subjectPubkey: string | null;
+  expiresAt: number;
+};
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -177,6 +183,15 @@ export class RelayDurableObject extends DurableObject<Env> {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS applications_token_hash_idx ON applications(token_hash);
+      CREATE TABLE IF NOT EXISTS app_sessions (
+        token_hash TEXT PRIMARY KEY,
+        app_id TEXT NOT NULL,
+        subject_pubkey TEXT,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(app_id) REFERENCES applications(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS app_sessions_expiry_idx ON app_sessions(expires_at);
       CREATE TABLE IF NOT EXISTS users (
         pubkey TEXT PRIMARY KEY,
         name TEXT NOT NULL DEFAULT '',
@@ -252,6 +267,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
       return this.handleUpgrade(request);
     }
+    if (url.pathname === '/api/app/session') return this.issueAppSession(request);
     if (url.pathname.startsWith('/api/admin/')) return this.handleAdmin(request, url);
     return new Response('Not found', { status: 404 });
   }
@@ -262,12 +278,14 @@ export class RelayDurableObject extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     const requestUrl = new URL(request.url);
-    const app = await this.resolveAppFromRequest(request);
+    const grant = await this.resolveAppSessionFromRequest(request);
     const attachment: SessionAttachment = {
       id: crypto.randomUUID(),
       challenge: randomToken(24),
       relay_host: requestUrl.host,
-      app_id: app?.id ?? null,
+      app_id: grant?.app.id ?? null,
+      app_session_expires_at: grant?.expiresAt ?? null,
+      app_session_pubkey: grant?.subjectPubkey ?? null,
       authenticated_pubkeys: [],
       subscriptions: {},
       rate_window_started_at: Date.now(),
@@ -284,10 +302,71 @@ export class RelayDurableObject extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client, headers });
   }
 
-  private async resolveAppFromRequest(request: Request): Promise<AppRecord | null> {
-    let token: string | null = null;
+  private bearerToken(request: Request): string | null {
     const auth = request.headers.get('authorization');
-    if (auth?.toLowerCase().startsWith('bearer ')) token = auth.slice(7).trim();
+    if (!auth?.toLowerCase().startsWith('bearer ')) return null;
+    const token = auth.slice(7).trim();
+    return token || null;
+  }
+
+  private async appFromLongTermToken(token: string): Promise<AppRecord | null> {
+    const tokenHash = await sha256Hex(token);
+    const rows = this.sql.exec(
+      'SELECT * FROM applications WHERE token_hash = ? AND enabled = 1 LIMIT 1',
+      tokenHash,
+    ).toArray() as SqlRow[];
+    if (!rows.length) return null;
+    const app = appFromRow(rows[0]);
+    const now = Math.floor(Date.now() / 1000);
+    if (app.expires_at !== null && app.expires_at <= now) return null;
+    return app;
+  }
+
+  private async issueAppSession(request: Request): Promise<Response> {
+    if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+    const token = this.bearerToken(request);
+    if (!token) return json({ error: 'unauthorized' }, 401);
+    const app = await this.appFromLongTermToken(token);
+    if (!app) return json({ error: 'unauthorized' }, 401);
+
+    let body: Record<string, unknown>;
+    try { body = await request.json() as Record<string, unknown>; }
+    catch { return json({ error: 'invalid_json' }, 400); }
+
+    const subjectRaw = body.subject;
+    let subjectPubkey: string | null = null;
+    if (subjectRaw !== undefined && subjectRaw !== null && subjectRaw !== '') {
+      subjectPubkey = normalizePubkey(String(subjectRaw));
+      if (!subjectPubkey) return json({ error: 'invalid_subject_pubkey' }, 400);
+    }
+    const ttl = body.ttl === undefined ? 600 : Number(body.ttl);
+    if (!Number.isSafeInteger(ttl) || ttl < 60 || ttl > 3600) return json({ error: 'invalid_ttl' }, 400);
+
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = now + ttl;
+    const sessionToken = `nrs_${randomToken(32)}`;
+    const sessionHash = await sha256Hex(sessionToken);
+
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec('DELETE FROM app_sessions WHERE expires_at <= ?', now);
+      this.sql.exec(
+        'INSERT INTO app_sessions(token_hash, app_id, subject_pubkey, expires_at, created_at) VALUES(?, ?, ?, ?, ?)',
+        sessionHash, app.id, subjectPubkey, expiresAt, now,
+      );
+    });
+
+    return json({
+      bindingVersion: 1,
+      token: sessionToken,
+      appId: app.id,
+      subject: subjectPubkey,
+      scope: 'relay',
+      expiresAt,
+    }, 201);
+  }
+
+  private async resolveAppSessionFromRequest(request: Request): Promise<AppSessionGrant | null> {
+    let token = this.bearerToken(request);
     if (!token) {
       const protocols = (request.headers.get('sec-websocket-protocol') ?? '').split(',').map(v => v.trim());
       const appProtocol = protocols.find(v => v.startsWith('relay-app.'));
@@ -296,12 +375,19 @@ export class RelayDurableObject extends DurableObject<Env> {
     if (!token) return null;
 
     const tokenHash = await sha256Hex(token);
-    const rows = this.sql.exec('SELECT * FROM applications WHERE token_hash = ? AND enabled = 1 LIMIT 1', tokenHash).toArray() as SqlRow[];
-    if (!rows.length) return null;
-    const app = appFromRow(rows[0]);
     const now = Math.floor(Date.now() / 1000);
-    if (app.expires_at !== null && app.expires_at <= now) return null;
+    const rows = this.sql.exec(
+      `SELECT a.*, s.subject_pubkey, s.expires_at AS session_expires_at
+       FROM app_sessions s
+       JOIN applications a ON a.id = s.app_id
+       WHERE s.token_hash = ? AND s.expires_at > ? AND a.enabled = 1
+       LIMIT 1`,
+      tokenHash, now,
+    ).toArray() as SqlRow[];
+    if (!rows.length) return null;
 
+    const app = appFromRow(rows[0]);
+    if (app.expires_at !== null && app.expires_at <= now) return null;
     if (app.type === 'web' && app.allowed_origins.length) {
       const origin = request.headers.get('origin');
       if (!origin) return null;
@@ -309,7 +395,13 @@ export class RelayDurableObject extends DurableObject<Env> {
       try { normalized = new URL(origin).origin; } catch { return null; }
       if (!app.allowed_origins.includes(normalized)) return null;
     }
-    return app;
+
+    const rawSubject = rows[0].subject_pubkey;
+    return {
+      app,
+      subjectPubkey: rawSubject === null || rawSubject === undefined || rawSubject === '' ? null : String(rawSubject),
+      expiresAt: Number(rows[0].session_expires_at),
+    };
   }
 
   private session(ws: WebSocket): SessionAttachment {
@@ -400,10 +492,18 @@ export class RelayDurableObject extends DurableObject<Env> {
   }
 
   private accessContext(session: SessionAttachment): { app: AppRecord | null; users: UserRecord[]; authenticatedPubkeys: string[] } {
+    const now = Math.floor(Date.now() / 1000);
+    const appSessionActive = !!session.app_id
+      && typeof session.app_session_expires_at === 'number'
+      && session.app_session_expires_at > now;
+    const authenticatedPubkeys = [...session.authenticated_pubkeys];
+    if (appSessionActive && session.app_session_pubkey && !authenticatedPubkeys.includes(session.app_session_pubkey)) {
+      authenticatedPubkeys.push(session.app_session_pubkey);
+    }
     return {
-      app: this.getAppById(session.app_id),
-      users: this.getUsers(session.authenticated_pubkeys),
-      authenticatedPubkeys: session.authenticated_pubkeys,
+      app: appSessionActive ? this.getAppById(session.app_id) : null,
+      users: this.getUsers(authenticatedPubkeys),
+      authenticatedPubkeys,
     };
   }
 
