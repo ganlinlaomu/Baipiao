@@ -1,4 +1,4 @@
-# Cloudflare Nostr Relay
+# Baipiao
 
 A Cloudflare-native Nostr relay with **application access control**, **NIP-42 user whitelists**, and a small owner dashboard. It is designed for relay owners who want a relay dedicated to their own application while optionally allowing other applications or individual Nostr users.
 
