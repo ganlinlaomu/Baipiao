@@ -20,7 +20,7 @@ The project is intentionally application-neutral. It is not tied to any Nostr cl
 
 ## Deploy to Cloudflare
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ganlinlaomu/cloudflare-nostr-relay)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ganlinlaomu/Baipiao)
 
 Cloudflare reads `wrangler.jsonc`, provisions the SQLite-backed Durable Object, and detects `ADMIN_TOKEN` from `.dev.vars.example` as a Worker secret. Enter a long random value for it on the deployment setup screen, then deploy.
 

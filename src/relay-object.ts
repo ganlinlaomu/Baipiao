@@ -246,7 +246,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     return {
       name: settings.relay_name,
       description: settings.relay_description,
-      software: 'https://github.com/ganlinlaomu/cloudflare-nostr-relay',
+      software: 'https://github.com/ganlinlaomu/Baipiao',
       version: '0.1.0',
       supported_nips: [1, 9, 11, 40, 42],
       limitation: {
