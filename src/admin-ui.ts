@@ -1,5 +1,5 @@
 export function adminHtml(): string {
-  return \`<!doctype html>
+  return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -29,11 +29,11 @@ export function adminHtml(): string {
 <div class="card"><h2>Users</h2><div class="grid"><label>npub or hex pubkey<input id="user_pubkey"></label><label>Name<input id="user_name" placeholder="Optional label"></label><label>Kinds (optional)<input id="user_kinds" placeholder="0,1,7,1059"></label><label>Permissions<select id="user_perm"><option value="rw">read + write</option><option value="r">read only</option><option value="w">write only</option></select></label></div><button id="createUserButton" type="button">Add user</button><div id="users"></div></div>
 </div></div>
 <script src="/admin.js" defer></script>
-</body></html>\`;
+</body></html>`;
 }
 
 export function adminScript(): string {
-  return \`(function(){
+  return `(function(){
 'use strict';
 var token='';
 var $=function(id){return document.getElementById(id)};
@@ -172,5 +172,5 @@ function init(){
 }
 
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init,{once:true});else init();
-})();\`;
+})();`;
 }
