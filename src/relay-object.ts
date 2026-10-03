@@ -206,6 +206,7 @@ export class RelayDurableObject extends DurableObject<Env> {
         id TEXT PRIMARY KEY,
         pubkey TEXT NOT NULL,
         created_at INTEGER NOT NULL,
+        received_at INTEGER,
         kind INTEGER NOT NULL,
         d_tag TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
@@ -238,6 +239,12 @@ export class RelayDurableObject extends DurableObject<Env> {
       );
       INSERT OR IGNORE INTO relay_metrics(id) VALUES(1);
     `);
+
+    const eventColumns = this.sql.exec('PRAGMA table_info(events)').toArray() as SqlRow[];
+    if (!eventColumns.some(column => String(column.name) === 'received_at')) {
+      this.sql.exec('ALTER TABLE events ADD COLUMN received_at INTEGER');
+    }
+    this.sql.exec('CREATE INDEX IF NOT EXISTS events_received_at_idx ON events(received_at DESC, id ASC)');
 
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
       this.sql.exec('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)', key, JSON.stringify(value));
@@ -561,11 +568,15 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
     const now = Math.floor(Date.now() / 1000);
     const recentWrites = (this.sql.exec(
-      'SELECT id, pubkey, created_at, kind FROM events ORDER BY created_at DESC, id ASC LIMIT 20',
+      `SELECT id, pubkey, created_at, received_at, kind
+       FROM events
+       ORDER BY (received_at IS NULL) ASC, received_at DESC, created_at DESC, id ASC
+       LIMIT 20`,
     ).toArray() as SqlRow[]).map(row => ({
       id: String(row.id),
       pubkey: String(row.pubkey),
       created_at: Number(row.created_at),
+      received_at: row.received_at === null || row.received_at === undefined ? null : Number(row.received_at),
       kind: Number(row.kind),
     }));
 
@@ -765,6 +776,7 @@ export class RelayDurableObject extends DurableObject<Env> {
 
   private storeEvent(event: NostrEvent, expiresAt: number | null): boolean {
     const dTag = getDTag(event);
+    const receivedAt = Math.floor(Date.now() / 1000);
     if (isReplaceableKind(event.kind) || isParameterizedReplaceableKind(event.kind)) {
       const rows = this.sql.exec(
         'SELECT id, created_at FROM events WHERE pubkey = ? AND kind = ? AND d_tag = ? ORDER BY created_at DESC, id ASC LIMIT 1',
@@ -781,8 +793,8 @@ export class RelayDurableObject extends DurableObject<Env> {
 
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(
-        'INSERT INTO events(id,pubkey,created_at,kind,d_tag,content,sig,tags_json,expires_at) VALUES(?,?,?,?,?,?,?,?,?)',
-        event.id, event.pubkey, event.created_at, event.kind, isParameterizedReplaceableKind(event.kind) ? dTag : '', event.content, event.sig, JSON.stringify(event.tags), expiresAt,
+        'INSERT INTO events(id,pubkey,created_at,received_at,kind,d_tag,content,sig,tags_json,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        event.id, event.pubkey, event.created_at, receivedAt, event.kind, isParameterizedReplaceableKind(event.kind) ? dTag : '', event.content, event.sig, JSON.stringify(event.tags), expiresAt,
       );
       for (const tag of event.tags) {
         if (tag.length < 2 || tag[0].length !== 1 || !/^[A-Za-z]$/.test(tag[0])) continue;

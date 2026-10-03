@@ -34,7 +34,7 @@ After deployment:
 
 ## Admin activity dashboard
 
-The `/admin` dashboard includes live and cumulative relay activity: active WebSocket connections, active subscriptions, active short-lived app sessions, stored event count, database size, read requests/events/denials, write attempts/accepted/denied, last read/write timestamps, and the 20 most recent stored events. Aggregate counters are stored in the Durable Object SQLite database so they survive hibernation and restarts.
+The `/admin` dashboard includes live and cumulative relay activity: active WebSocket connections, active subscriptions, active short-lived app sessions, stored event count, database size, read requests/events/denials, write attempts/accepted/denied, last read/write timestamps, and the 20 most recent stored events. Each recent stored event shows both the relay `received_at` timestamp and the signed Nostr event `created_at` timestamp. Existing rows created before `received_at` was introduced remain null and are shown as `Legacy / unknown` rather than being assigned a fabricated receive time. Aggregate counters are stored in the Durable Object SQLite database so they survive hibernation and restarts.
 
 ## Access policies
 

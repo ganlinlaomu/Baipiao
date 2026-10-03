@@ -19,7 +19,7 @@ export function adminHtml(): string {
   <div id="stats" class="stats"></div>
   <div id="activityMeta" class="muted activity-meta"></div>
   <h3>Recent stored writes / 最近写入</h3>
-  <div class="table-wrap"><table class="activity-table"><thead><tr><th>Time</th><th>Kind</th><th>Pubkey</th><th>Event ID</th></tr></thead><tbody id="recentWrites"></tbody></table></div>
+  <div class="table-wrap"><table class="activity-table"><thead><tr><th>Received / 写入时间</th><th>Event time / 事件时间</th><th>Kind</th><th>Pubkey</th><th>Event ID</th></tr></thead><tbody id="recentWrites"></tbody></table></div>
 </div>
 <div class="card"><h2>Relay policy</h2><div class="grid">
 <label>Name<input id="relay_name"></label><label>Description<input id="relay_description"></label>
@@ -67,6 +67,7 @@ async function api(path,opt){
 function formatNumber(value){return Number(value||0).toLocaleString()}
 function formatBytes(value){var n=Number(value||0);if(n<1024)return n+' B';if(n<1024*1024)return (n/1024).toFixed(1)+' KiB';return (n/1024/1024).toFixed(2)+' MiB'}
 function formatTime(value){var n=Number(value);if(!Number.isFinite(n)||n<=0)return '—';return new Date(n*1000).toLocaleString()}
+function formatReceivedTime(value){return value===null||value===undefined?'Legacy / unknown':formatTime(value)}
 function shortHex(value){var s=String(value||'');return s.length>18?s.slice(0,10)+'…'+s.slice(-6):s}
 function renderStats(stats){
   var cards=[
@@ -93,13 +94,13 @@ function renderStats(stats){
   var tbody=$('recentWrites');tbody.textContent='';
   (stats.recent_writes||[]).forEach(function(item){
     var tr=document.createElement('tr');
-    [formatTime(item.created_at),String(item.kind),shortHex(item.pubkey),shortHex(item.id)].forEach(function(value,index){
-      var td=document.createElement('td');td.textContent=value;if(index>=2)td.className='mono';tr.appendChild(td);
+    [formatReceivedTime(item.received_at),formatTime(item.created_at),String(item.kind),shortHex(item.pubkey),shortHex(item.id)].forEach(function(value,index){
+      var td=document.createElement('td');td.textContent=value;if(index>=3)td.className='mono';tr.appendChild(td);
     });
     tbody.appendChild(tr);
   });
   if(!(stats.recent_writes||[]).length){
-    var tr=document.createElement('tr');var td=document.createElement('td');td.colSpan=4;td.className='muted';td.textContent='No stored writes yet.';tr.appendChild(td);tbody.appendChild(tr);
+    var tr=document.createElement('tr');var td=document.createElement('td');td.colSpan=5;td.className='muted';td.textContent='No stored writes yet.';tr.appendChild(td);tbody.appendChild(tr);
   }
 }
 

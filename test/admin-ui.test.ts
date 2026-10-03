@@ -27,5 +27,8 @@ describe('admin UI', () => {
     expect(script).toContain('/api/admin/stats');
     expect(script).toContain('Write accepted / 写入成功');
     expect(script).toContain('Read REQ / 读取请求');
+    expect(html).toContain('Received / 写入时间');
+    expect(html).toContain('Event time / 事件时间');
+    expect(script).toContain('Legacy / unknown');
   });
 });
