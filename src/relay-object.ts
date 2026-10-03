@@ -225,6 +225,18 @@ export class RelayDurableObject extends DurableObject<Env> {
         FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS event_tags_lookup_idx ON event_tags(name, value, event_id);
+      CREATE TABLE IF NOT EXISTS relay_metrics (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        read_requests INTEGER NOT NULL DEFAULT 0,
+        read_events INTEGER NOT NULL DEFAULT 0,
+        read_denied INTEGER NOT NULL DEFAULT 0,
+        write_attempts INTEGER NOT NULL DEFAULT 0,
+        write_accepted INTEGER NOT NULL DEFAULT 0,
+        write_denied INTEGER NOT NULL DEFAULT 0,
+        last_read_at INTEGER,
+        last_write_at INTEGER
+      );
+      INSERT OR IGNORE INTO relay_metrics(id) VALUES(1);
     `);
 
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
@@ -507,15 +519,85 @@ export class RelayDurableObject extends DurableObject<Env> {
     };
   }
 
+
+  private recordRead(eventsReturned: number, denied: boolean): void {
+    const now = Math.floor(Date.now() / 1000);
+    this.sql.exec(
+      `UPDATE relay_metrics
+       SET read_requests = read_requests + 1,
+           read_events = read_events + ?,
+           read_denied = read_denied + ?,
+           last_read_at = ?
+       WHERE id = 1`,
+      Math.max(0, eventsReturned), denied ? 1 : 0, now,
+    );
+  }
+
+  private recordWrite(accepted: boolean): void {
+    const now = Math.floor(Date.now() / 1000);
+    this.sql.exec(
+      `UPDATE relay_metrics
+       SET write_attempts = write_attempts + 1,
+           write_accepted = write_accepted + ?,
+           write_denied = write_denied + ?,
+           last_write_at = ?
+       WHERE id = 1`,
+      accepted ? 1 : 0, accepted ? 0 : 1, now,
+    );
+  }
+
+  private getRelayStats(): Record<string, unknown> {
+    const metricRows = this.sql.exec('SELECT * FROM relay_metrics WHERE id = 1').toArray() as SqlRow[];
+    const metrics = metricRows[0] ?? {};
+    const count = (sql: string, ...bindings: SqlStorageValue[]) => {
+      const rows = this.sql.exec(sql, ...bindings).toArray() as SqlRow[];
+      return Number(rows[0]?.count ?? 0);
+    };
+    const sockets = this.ctx.getWebSockets();
+    let activeSubscriptions = 0;
+    for (const socket of sockets) {
+      const session = socket.deserializeAttachment() as SessionAttachment | null;
+      if (session) activeSubscriptions += Object.keys(session.subscriptions ?? {}).length;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const recentWrites = (this.sql.exec(
+      'SELECT id, pubkey, created_at, kind FROM events ORDER BY created_at DESC, id ASC LIMIT 20',
+    ).toArray() as SqlRow[]).map(row => ({
+      id: String(row.id),
+      pubkey: String(row.pubkey),
+      created_at: Number(row.created_at),
+      kind: Number(row.kind),
+    }));
+
+    return {
+      active_connections: sockets.length,
+      active_subscriptions: activeSubscriptions,
+      active_app_sessions: count('SELECT COUNT(*) AS count FROM app_sessions WHERE expires_at > ?', now),
+      stored_events: count('SELECT COUNT(*) AS count FROM events'),
+      database_bytes: this.sql.databaseSize,
+      read_requests: Number(metrics.read_requests ?? 0),
+      read_events: Number(metrics.read_events ?? 0),
+      read_denied: Number(metrics.read_denied ?? 0),
+      write_attempts: Number(metrics.write_attempts ?? 0),
+      write_accepted: Number(metrics.write_accepted ?? 0),
+      write_denied: Number(metrics.write_denied ?? 0),
+      last_read_at: metrics.last_read_at === null || metrics.last_read_at === undefined ? null : Number(metrics.last_read_at),
+      last_write_at: metrics.last_write_at === null || metrics.last_write_at === undefined ? null : Number(metrics.last_write_at),
+      recent_writes: recentWrites,
+    };
+  }
+
   private async handleReq(ws: WebSocket, msg: unknown[]): Promise<void> {
     const settings = this.getSettings();
     const subId = msg[1];
     const filters = msg.slice(2);
     if (typeof subId !== 'string' || !subId.length || subId.length > 64) {
+      this.recordRead(0, true);
       ws.send(JSON.stringify(['NOTICE', 'invalid subscription id']));
       return;
     }
     if (!filters.length || filters.length > settings.max_filters || !filters.every(isValidFilter)) {
+      this.recordRead(0, true);
       ws.send(JSON.stringify(['CLOSED', subId, 'invalid: invalid or excessive filters']));
       return;
     }
@@ -523,6 +605,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     const session = this.session(ws);
     const existing = Object.keys(session.subscriptions);
     if (!session.subscriptions[subId] && existing.length >= settings.max_subscriptions) {
+      this.recordRead(0, true);
       ws.send(JSON.stringify(['CLOSED', subId, 'restricted: too many subscriptions']));
       return;
     }
@@ -530,6 +613,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     const typedFilters = filters as NostrFilter[];
     const decision = evaluateRead(settings, this.accessContext(session), typedFilters);
     if (!decision.allowed) {
+      this.recordRead(0, true);
       ws.send(JSON.stringify(['CLOSED', subId, formatDecision(decision.prefix, decision.reason)]));
       return;
     }
@@ -539,6 +623,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       for (const event of this.queryFilter(filter, settings)) events.set(event.id, event);
     }
     const ordered = [...events.values()].sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id));
+    this.recordRead(ordered.length, false);
     for (const event of ordered) ws.send(JSON.stringify(['EVENT', subId, event]));
     ws.send(JSON.stringify(['EOSE', subId]));
 
@@ -601,25 +686,30 @@ export class RelayDurableObject extends DurableObject<Env> {
     const candidate = msg[1];
     const id = isValidEventShape(candidate) ? candidate.id : '';
     if (bytes > settings.max_event_bytes) {
+      this.recordWrite(false);
       ws.send(JSON.stringify(['OK', id, false, 'invalid: event message exceeds relay size limit']));
       return;
     }
     if (!isValidEventShape(candidate) || !verifyEvent(candidate)) {
+      this.recordWrite(false);
       ws.send(JSON.stringify(['OK', id, false, 'invalid: event id or signature is invalid']));
       return;
     }
     const event = candidate as NostrEvent;
     if (event.kind === 22242) {
+      this.recordWrite(false);
       ws.send(JSON.stringify(['OK', event.id, false, 'invalid: kind 22242 is reserved for AUTH']));
       return;
     }
     const now = Math.floor(Date.now() / 1000);
     if (event.created_at > now + settings.max_future_seconds) {
+      this.recordWrite(false);
       ws.send(JSON.stringify(['OK', event.id, false, 'invalid: event timestamp is too far in the future']));
       return;
     }
     const expiration = getExpiration(event);
     if (expiration !== null && expiration <= now) {
+      this.recordWrite(false);
       ws.send(JSON.stringify(['OK', event.id, false, 'blocked: event is already expired']));
       return;
     }
@@ -628,11 +718,13 @@ export class RelayDurableObject extends DurableObject<Env> {
     const ctx = this.accessContext(session);
     const decision = evaluateWrite(settings, ctx, event.kind);
     if (!decision.allowed) {
+      this.recordWrite(false);
       ws.send(JSON.stringify(['OK', event.id, false, formatDecision(decision.prefix, decision.reason)]));
       return;
     }
     if (!this.consumeRate(session, ctx.app?.rate_limit ?? settings.default_rate_limit)) {
       this.saveSession(ws, session);
+      this.recordWrite(false);
       ws.send(JSON.stringify(['OK', event.id, false, 'rate-limited: write rate exceeded']));
       return;
     }
@@ -640,6 +732,7 @@ export class RelayDurableObject extends DurableObject<Env> {
 
     const existing = this.sql.exec('SELECT id FROM events WHERE id = ? LIMIT 1', event.id).toArray();
     if (existing.length) {
+      this.recordWrite(true);
       ws.send(JSON.stringify(['OK', event.id, true, 'duplicate: already stored']));
       return;
     }
@@ -647,12 +740,14 @@ export class RelayDurableObject extends DurableObject<Env> {
     if (!isEphemeralKind(event.kind)) {
       const stored = this.storeEvent(event, expiration);
       if (!stored) {
+        this.recordWrite(true);
         ws.send(JSON.stringify(['OK', event.id, true, 'duplicate: newer replaceable event already stored']));
         return;
       }
       if (event.kind === 5) this.applyDeletion(event);
     }
 
+    this.recordWrite(true);
     ws.send(JSON.stringify(['OK', event.id, true, '']));
     this.broadcast(event);
   }
@@ -730,7 +825,10 @@ export class RelayDurableObject extends DurableObject<Env> {
   private async handleAdmin(request: Request, url: URL): Promise<Response> {
     try {
       if (request.method === 'GET' && url.pathname === '/api/admin/state') {
-        return json({ settings: this.getSettings(), apps: this.listApps(), users: this.listUsers(), database_bytes: this.sql.databaseSize });
+        return json({ settings: this.getSettings(), apps: this.listApps(), users: this.listUsers(), stats: this.getRelayStats(), database_bytes: this.sql.databaseSize });
+      }
+      if (request.method === 'GET' && url.pathname === '/api/admin/stats') {
+        return json(this.getRelayStats());
       }
       if (request.method === 'PUT' && url.pathname === '/api/admin/settings') {
         const body = await request.json() as Record<string, unknown>;

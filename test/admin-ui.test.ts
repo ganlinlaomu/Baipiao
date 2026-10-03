@@ -18,4 +18,14 @@ describe('admin UI', () => {
     expect(script).toContain('safeStorageGet');
     expect(script).toContain('try{');
   });
+
+  it('renders relay read/write activity without inline handlers', () => {
+    const html = adminHtml();
+    const script = adminScript();
+    expect(html).toContain('Relay activity / 读写状态');
+    expect(html).toContain('recentWrites');
+    expect(script).toContain('/api/admin/stats');
+    expect(script).toContain('Write accepted / 写入成功');
+    expect(script).toContain('Read REQ / 读取请求');
+  });
 });

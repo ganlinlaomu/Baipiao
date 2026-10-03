@@ -32,6 +32,10 @@ After deployment:
 4. Add your first application and copy its token. The raw token is shown only once.
 5. Optionally add Nostr users by `npub` or hex pubkey.
 
+## Admin activity dashboard
+
+The `/admin` dashboard includes live and cumulative relay activity: active WebSocket connections, active subscriptions, active short-lived app sessions, stored event count, database size, read requests/events/denials, write attempts/accepted/denied, last read/write timestamps, and the 20 most recent stored events. Aggregate counters are stored in the Durable Object SQLite database so they survive hibernation and restarts.
+
 ## Access policies
 
 Read and write policies are independent. Each can be set to:
