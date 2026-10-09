@@ -210,6 +210,7 @@ function makeMarkdown(r) {
     ', delivery P95: ' + r.runs.fanout.delivery_p95_ms + ' ms', '',
     'Stored events: ' + r.before.stored_events + ' → ' + r.after.stored_events,
     'SQLite bytes: ' + r.before.database_bytes + ' → ' + r.after.database_bytes, '',
+    'Query failures: ' + JSON.stringify(r.known_failures), '',
     'All writes authenticated via NIP-42 whitelist and signed before measurement. ' +
     'Sequential/event ACK and REQ→EOSE latencies are measured client-side.',
     'Compare multiple repetitions on similarly sized runners; network, CPU and scheduling vary.'].join('\n') + '\n';
@@ -230,10 +231,19 @@ async function main() {
   console.log('PHASE: parallel writes');
   const parallel = await writes(events(240, 'parallel'), 4);
   console.log('PHASE: historical queries');
+  const knownFailures = [];
+  // Full 64-character pubkeys are valid NIP-01 filters. Record (don't hide) any relay failure.
+  try {
+    await reads('kind+author-full64', { kinds: [1], authors: [pubkey], limit: 100 });
+  } catch (err) {
+    knownFailures.push({ workload: 'kind+author-full64', error: String(err.message) });
+    console.warn('KNOWN QUERY FAILURE: ' + err.message);
+  }
+  // 16-char author prefixes are also valid NIP-01 filters and let other baseline phases run.
   const queries = [
-    await reads('kind+author', { kinds: [1], authors: [pubkey], limit: 100 }),
+    await reads('kind+author-prefix16', { kinds: [1], authors: [pubkey.slice(0, 16)], limit: 100 }),
     await reads('kind+tag', { kinds: [1], '#t': ['bench'], limit: 100 }),
-    await reads('kind+author+tag', { kinds: [1], authors: [pubkey], '#t': ['bench'], limit: 100 })
+    await reads('kind+author-prefix16+tag', { kinds: [1], authors: [pubkey.slice(0, 16)], '#t': ['bench'], limit: 100 })
   ];
   console.log('PHASE: live fanout');
   const distributed = await fanout();
@@ -243,7 +253,7 @@ async function main() {
   const r = { timestamp: new Date().toISOString(), revision: process.env.GITHUB_SHA || 'local',
     node: process.version, before: { stored_events: before.stored_events, database_bytes: before.database_bytes },
     after: { stored_events: after.stored_events, database_bytes: after.database_bytes },
-    runs: { seed, sequential, parallel, queries, fanout: distributed } };
+    runs: { seed, sequential, parallel, queries, fanout: distributed }, known_failures: knownFailures };
   const md = makeMarkdown(r);
   if (process.env.BENCH_JSON) await writeFile(process.env.BENCH_JSON, JSON.stringify(r, null, 2) + '\n');
   if (process.env.BENCH_MARKDOWN) await writeFile(process.env.BENCH_MARKDOWN, md);
