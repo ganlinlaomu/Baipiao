@@ -1,0 +1,51 @@
+name: Relay performance baseline
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'bench/**'
+      - '.github/workflows/benchmark.yml'
+permissions:
+  contents: read
+jobs:
+  isolated-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install
+      - name: Start disposable Wrangler relay
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'ADMIN_TOKEN=baipiao-isolated-benchmark-ci-token' > .dev.vars
+          npx wrangler dev --local --ip 127.0.0.1 --port 8787 > /tmp/baipiao-benchmark-wrangler.log 2>&1 &
+          echo "$!" > /tmp/baipiao-benchmark.pid
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:8787/health > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat /tmp/baipiao-benchmark-wrangler.log
+          exit 1
+      - name: Signed-event performance measurements
+        env:
+          BENCH_ADMIN_TOKEN: baipiao-isolated-benchmark-ci-token
+          BENCH_JSON: benchmark-results.json
+          BENCH_MARKDOWN: benchmark-results.md
+        run: node bench/relay.mjs
+      - name: Report benchmark summary
+        if: success()
+        run: cat benchmark-results.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baipiao-relay-baseline
+          path: |
+            benchmark-results.json
+            benchmark-results.md
+          if-no-files-found: ignore
