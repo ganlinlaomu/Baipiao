@@ -79,6 +79,11 @@ class Client {
           const query = this.reqs.get(msg[1]);
           if (query) { this.reqs.delete(msg[1]); query.resolve({ count: query.count, first: query.first }); }
         }
+        if (msg[0] === 'NOTICE') {
+          const notice = String(msg[1]);
+          this.lastNotice = notice;
+          for (const [id, q] of this.reqs) { this.reqs.delete(id); q.reject(new Error('Relay NOTICE: ' + notice)); }
+        }
         if (msg[0] === 'CLOSED') {
           const query = this.reqs.get(msg[1]);
           if (query) { this.reqs.delete(msg[1]); query.reject(new Error('REQ closed: ' + msg[2])); }
@@ -116,6 +121,7 @@ class Client {
     this.ws.send(JSON.stringify(['REQ', id, filter]));
     let result;
     try { result = await withTimeout(promise, 'REQ EOSE ' + id); }
+    catch (error) { throw new Error(String(error.message) + ' notice=' + (this.lastNotice || '(none)') + ' messageError=' + (this.messageError || '(none)')); }
     finally { this.reqs.delete(id); }
     const end = performance.now();
     this.ws.send(JSON.stringify(['CLOSE', id]));
@@ -217,14 +223,19 @@ async function main() {
   const [warm] = await openMany(1);
   try { for (const ev of events(12, 'warm')) await warm.write(ev); }
   finally { warm.close(); }
+  console.log('PHASE: seed writes');
   const seed = await writes(events(240, 'seed'), 4);
+  console.log('PHASE: sequential writes');
   const sequential = await writes(events(60, 'sequential'), 1);
+  console.log('PHASE: parallel writes');
   const parallel = await writes(events(240, 'parallel'), 4);
+  console.log('PHASE: historical queries');
   const queries = [
     await reads('kind+author', { kinds: [1], authors: [pubkey], limit: 100 }),
     await reads('kind+tag', { kinds: [1], '#t': ['bench'], limit: 100 }),
     await reads('kind+author+tag', { kinds: [1], authors: [pubkey], '#t': ['bench'], limit: 100 })
   ];
+  console.log('PHASE: live fanout');
   const distributed = await fanout();
   const after = (await admin('/api/admin/state')).stats;
   assert.equal(+after.stored_events - +before.stored_events, 12 + 240 + 60 + 240 + 30,
