@@ -102,7 +102,7 @@ The client replies with a signed `kind:22242` authentication event. The relay ve
 - `kind === 22242`
 - timestamp within approximately 10 minutes
 - exact challenge tag
-- relay tag host matches this relay
+- relay tag exactly matches the connected relay WebSocket URL (scheme, host, and path)
 
 The authenticated pubkey belongs to the **connection session**. Published event pubkeys do not have to equal the NIP-42 pubkey. This is important for NIP-59 gift wraps, which use ephemeral outer keys.
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { schnorr } from '@noble/curves/secp256k1';
 import { bytesToHex } from '@noble/hashes/utils';
-import { eventMatchesFilter, getEventHash, normalizePubkey, verifyEvent } from '../src/nostr';
+import { eventMatchesFilter, getEventHash, normalizePubkey, relayTagMatchesUrl, verifyEvent } from '../src/nostr';
 import type { NostrEvent } from '../src/types';
 
 function signedEvent(kind = 1): NostrEvent {
@@ -38,5 +38,14 @@ describe('nostr primitives', () => {
   it('normalizes a hex pubkey', () => {
     const event = signedEvent();
     expect(normalizePubkey(event.pubkey)).toBe(event.pubkey);
+  });
+
+  it('binds a NIP-42 relay tag to the exact WebSocket endpoint', () => {
+    const relay = 'wss://relay.example/relay';
+    expect(relayTagMatchesUrl(relay, relay)).toBe(true);
+    expect(relayTagMatchesUrl('wss://relay.example/', relay)).toBe(false);
+    expect(relayTagMatchesUrl('wss://relay.example/another-endpoint', relay)).toBe(false);
+    expect(relayTagMatchesUrl('ws://relay.example/relay', relay)).toBe(false);
+    expect(relayTagMatchesUrl('wss://relay.example/relay?token=ignored', relay)).toBe(false);
   });
 });

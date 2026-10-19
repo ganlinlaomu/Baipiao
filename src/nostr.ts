@@ -129,6 +129,30 @@ export function relayTagMatchesHost(relayTag: string, expectedHost: string): boo
   }
 }
 
+/**
+ * NIP-42 binds an AUTH event to a relay URL, not merely to a host. Keeping the
+ * path in that binding prevents an event issued for another endpoint on the
+ * same host from authorizing this relay connection.
+ */
+export function relayTagMatchesUrl(relayTag: string, expectedRelayUrl: string): boolean {
+  try {
+    const actual = new URL(relayTag);
+    const expected = new URL(expectedRelayUrl);
+    const validScheme = (url: URL) => url.protocol === 'wss:' || url.protocol === 'ws:';
+    return validScheme(actual)
+      && validScheme(expected)
+      && actual.protocol === expected.protocol
+      && actual.host.toLowerCase() === expected.host.toLowerCase()
+      && actual.pathname === expected.pathname
+      && actual.search === ''
+      && actual.hash === ''
+      && actual.username === ''
+      && actual.password === '';
+  } catch {
+    return false;
+  }
+}
+
 export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');

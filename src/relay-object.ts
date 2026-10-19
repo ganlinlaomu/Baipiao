@@ -13,6 +13,7 @@ import {
   normalizePubkey,
   randomToken,
   relayTagMatchesHost,
+  relayTagMatchesUrl,
   sha256Hex,
   verifyEvent,
 } from './nostr';
@@ -262,6 +263,11 @@ export class RelayDurableObject extends DurableObject<Env> {
 
   async relayInfo(): Promise<Record<string, unknown>> {
     const settings = this.getSettings();
+    // NIP-11 has a single boolean for this. Advertise authentication whenever
+    // either configured policy can require a NIP-42 identity, even when an app
+    // session may alternatively satisfy that policy.
+    const authRequired = [settings.read_policy, settings.write_policy]
+      .some(mode => mode === 'user' || mode === 'app_or_user' || mode === 'app_and_user');
     return {
       name: settings.relay_name,
       description: settings.relay_description,
@@ -269,7 +275,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       version: '0.1.0',
       supported_nips: [1, 9, 11, 40, 42],
       limitation: {
-        auth_required: false,
+        auth_required: authRequired,
         restricted_writes: settings.write_policy !== 'public',
         max_message_length: settings.max_event_bytes,
         max_subscriptions: settings.max_subscriptions,
@@ -297,10 +303,15 @@ export class RelayDurableObject extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     const requestUrl = new URL(request.url);
+    const relayUrl = new URL(requestUrl.toString());
+    relayUrl.protocol = requestUrl.protocol === 'http:' ? 'ws:' : 'wss:';
+    relayUrl.search = '';
+    relayUrl.hash = '';
     const grant = await this.resolveAppSessionFromRequest(request);
     const attachment: SessionAttachment = {
       id: crypto.randomUUID(),
       challenge: randomToken(24),
+      relay_url: relayUrl.toString(),
       relay_host: requestUrl.host,
       app_id: grant?.app.id ?? null,
       app_session_expires_at: grant?.expiresAt ?? null,
@@ -485,7 +496,12 @@ export class RelayDurableObject extends DurableObject<Env> {
       return;
     }
     const relayTag = getRelayTag(event);
-    if (!relayTag || !relayTagMatchesHost(relayTag, session.relay_host)) {
+    // `relay_url` is present for new sessions. Keep the host fallback only for
+    // hibernating connections created before this field was introduced.
+    const relayMatches = session.relay_url
+      ? relayTagMatchesUrl(relayTag ?? '', session.relay_url)
+      : !!relayTag && relayTagMatchesHost(relayTag, session.relay_host);
+    if (!relayMatches) {
       ws.send(JSON.stringify(['OK', event.id, false, 'invalid: relay tag does not match this relay']));
       return;
     }

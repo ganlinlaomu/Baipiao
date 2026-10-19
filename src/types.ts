@@ -68,6 +68,8 @@ export interface RelaySettings {
 export interface SessionAttachment {
   id: string;
   challenge: string;
+  /** Canonical WebSocket URL for this connection's relay endpoint. */
+  relay_url?: string;
   relay_host: string;
   app_id: string | null;
   app_session_expires_at: number | null;
