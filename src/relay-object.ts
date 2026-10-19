@@ -839,13 +839,30 @@ export class RelayDurableObject extends DurableObject<Env> {
   }
 
   private broadcast(event: NostrEvent): void {
+    const settings = this.getSettings();
     for (const socket of this.ctx.getWebSockets()) {
       const session = socket.deserializeAttachment() as SessionAttachment | null;
       if (!session) continue;
-      for (const [subId, filters] of Object.entries(session.subscriptions ?? {})) {
-        if (filters.some(filter => eventMatchesFilter(event, filter))) {
-          try { socket.send(JSON.stringify(['EVENT', subId, event])); } catch { /* disconnected */ }
-        }
+      const matching = Object.entries(session.subscriptions ?? {}).filter(([, filters]) => filters.some(filter => eventMatchesFilter(event, filter)));
+      if (!matching.length) continue;
+      // Read access was checked at REQ time. App sessions expire and admins can
+      // disable apps or users since then, so re-check before every live delivery.
+      const ctx = this.accessContext(session);
+      let revoked = false;
+      for (const [subId, filters] of matching) {
+        const decision = evaluateRead(settings, ctx, filters);
+        try {
+          if (decision.allowed) {
+            socket.send(JSON.stringify(['EVENT', subId, event]));
+          } else {
+            delete session.subscriptions[subId];
+            revoked = true;
+            socket.send(JSON.stringify(['CLOSED', subId, formatDecision(decision.prefix, decision.reason)]));
+          }
+        } catch { /* disconnected */ }
+      }
+      if (revoked) {
+        try { this.saveSession(socket, session); } catch { /* disconnected */ }
       }
     }
   }
