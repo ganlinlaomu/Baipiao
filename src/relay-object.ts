@@ -46,6 +46,7 @@ const DEFAULT_SETTINGS: RelaySettings = {
 const ACCESS_MODES = new Set(['public', 'app', 'user', 'app_or_user', 'app_and_user']);
 const APP_TYPES = new Set(['web', 'native', 'service']);
 const encoder = new TextEncoder();
+const MAX_APP_SESSION_TTL = 24 * 60 * 60;
 const TAG_BACKFILL_BATCH = 2000;
 const TAG_BACKFILL_DELAY_MS = 10_000;
 const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60_000;
@@ -474,7 +475,10 @@ export class RelayDurableObject extends DurableObject<Env> {
       if (!subjectPubkey) return json({ error: 'invalid_subject_pubkey' }, 400);
     }
     const ttl = body.ttl === undefined ? 600 : Number(body.ttl);
-    if (!Number.isSafeInteger(ttl) || ttl < 60 || ttl > 3600) return json({ error: 'invalid_ttl' }, 400);
+    // Up to a day, so a client can reuse its session across launches instead
+    // of paying two round trips on every start. Disabling the application
+    // still revokes every session immediately (checked on each use).
+    if (!Number.isSafeInteger(ttl) || ttl < 60 || ttl > MAX_APP_SESSION_TTL) return json({ error: 'invalid_ttl' }, 400);
 
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = now + ttl;
