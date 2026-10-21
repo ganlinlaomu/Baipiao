@@ -118,6 +118,10 @@ Current first release advertises:
 
 NIP-01 replaceable, ephemeral, and addressable event storage semantics are implemented. Generic event kinds used by features such as NIP-51 or NIP-59 do not require special relay-side code and can be stored subject to owner policy.
 
+Filter extension `received_since` (advertised as `"received_since": true` in NIP-11): only events this relay stored at or after that Unix time. A client can fetch just what arrived since its last sync instead of re-reading the NIP-59 two-day backdating window. Relays without the extension ignore the field, so clients should check NIP-11 first.
+
+Maintenance runs on a Durable Object alarm every 6 hours. It purges NIP-40 expired events (in batches of 500) and expired app sessions.
+
 NIP-59 gift wraps (kind 1059) are served only to a connection authenticated as one of the wrap's `p` recipients, through NIP-42 or an app session subject. Content is encrypted, but who receives wraps, how many, and when would otherwise be visible to every reader.
 
 ## Free-tier protections

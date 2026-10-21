@@ -4,6 +4,9 @@ export const GIFT_WRAP_KIND = 1059;
 const FULL_HEX = /^[0-9a-f]{64}$/;
 const MAX_TERMS = 80;
 
+/** One index-ordered batch of expired event ids; bindings: now, batch size. */
+export const EXPIRED_EVENTS_BATCH_SQL = 'SELECT id FROM events WHERE expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at LIMIT ?';
+
 export type SqlValue = string | number | null;
 export type FilterQuery = { sql: string; bindings: SqlValue[] };
 
@@ -66,10 +69,20 @@ export function buildFilterQuery(filter: NostrFilter, options: QueryOptions): Fi
   // first so a page reads about `limit` rows instead of every event in the
   // time window. Several values could match one event twice, so they keep
   // the event-driven plan below.
-  const driver = options.tagIndexReady ? tags.find(([, values]) => values.length === 1) : undefined;
+  // received_since reads only what arrived since then, across the whole
+  // relay, which is far fewer rows than one recipient's backdating window.
+  const byReceipt = filter.received_since !== undefined;
+  const driver = options.tagIndexReady && !byReceipt ? tags.find(([, values]) => values.length === 1) : undefined;
   let from = 'events e';
   let order = 'e.created_at DESC, e.id ASC';
-  if (driver) {
+  if (byReceipt) {
+    from = 'events e INDEXED BY events_received_at_idx';
+    order = 'e.received_at DESC, e.id ASC';
+    where.push('e.received_at >= ?');
+    bindings.push(filter.received_since!);
+    if (filter.since !== undefined) { where.push('e.created_at >= ?'); bindings.push(filter.since); }
+    if (filter.until !== undefined) { where.push('e.created_at <= ?'); bindings.push(filter.until); }
+  } else if (driver) {
     from = 'event_tags t CROSS JOIN events e ON e.id = t.event_id';
     order = 't.created_at DESC, t.event_id ASC';
     where.push('t.name = ?', 't.value = ?');

@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { eventMatchesFilter } from '../src/nostr';
-import { buildFilterQuery, giftWrapVisible, GIFT_WRAP_KIND } from '../src/query';
+import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible, GIFT_WRAP_KIND } from '../src/query';
 import type { NostrEvent, NostrFilter } from '../src/types';
 
 // Mirrors the events/event_tags schema and indexes in relay-object.ts.
@@ -17,6 +17,8 @@ function database() {
     CREATE INDEX events_pubkey_created_idx ON events(pubkey, created_at DESC);
     CREATE INDEX events_kind_created_idx ON events(kind, created_at DESC);
     CREATE INDEX events_replaceable_idx ON events(pubkey, kind, d_tag, created_at DESC, id ASC);
+    CREATE INDEX events_received_at_idx ON events(received_at DESC, id ASC);
+    CREATE INDEX events_expires_idx ON events(expires_at) WHERE expires_at IS NOT NULL;
     CREATE TABLE event_tags (
       event_id TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, created_at INTEGER,
       PRIMARY KEY(event_id, name, value)
@@ -50,11 +52,15 @@ function makeEvents(): NostrEvent[] {
   return events;
 }
 
+// Wraps are backdated, so arrival order differs from created_at order.
+const receivedAt = (event: NostrEvent) => 20_000 + (parseInt(event.id.slice(-4), 16) * 7) % 600;
+const expiresAt = (event: NostrEvent) => parseInt(event.id.slice(-4), 16) % 10 === 0 ? 50 + parseInt(event.id.slice(-4), 16) : null;
+
 function insert(db: DatabaseSync, events: NostrEvent[]) {
-  const insertEvent = db.prepare('INSERT INTO events(id,pubkey,created_at,kind,content,sig,tags_json) VALUES(?,?,?,?,?,?,?)');
+  const insertEvent = db.prepare('INSERT INTO events(id,pubkey,created_at,received_at,kind,content,sig,tags_json,expires_at) VALUES(?,?,?,?,?,?,?,?,?)');
   const insertTag = db.prepare('INSERT OR IGNORE INTO event_tags(event_id,name,value,created_at) VALUES(?,?,?,?)');
   for (const event of events) {
-    insertEvent.run(event.id, event.pubkey, event.created_at, event.kind, event.content, event.sig, JSON.stringify(event.tags));
+    insertEvent.run(event.id, event.pubkey, event.created_at, receivedAt(event), event.kind, event.content, event.sig, JSON.stringify(event.tags), expiresAt(event));
     for (const tag of event.tags) insertTag.run(event.id, tag[0], tag[1], event.created_at);
   }
 }
@@ -124,6 +130,30 @@ describe('filter queries', () => {
     expect(plan).toContain('event_tags_time_idx');
     expect(plan).not.toMatch(/SCAN e\b/);
     expect(plan).not.toContain('TEMP B-TREE FOR ORDER BY');
+  });
+
+  it('received_since returns only what arrived since then, from the arrival index', () => {
+    const filter = { kinds: [GIFT_WRAP_KIND], '#p': [ALICE], received_since: 20_450 };
+    const ids = run(db, filter, [ALICE], true, 1_000);
+    const want = events
+      .filter(event => event.kind === GIFT_WRAP_KIND && event.tags[0][1] === ALICE && receivedAt(event) >= 20_450)
+      .map(event => event.id);
+    expect(ids.length).toBeGreaterThan(0);
+    expect([...ids].sort()).toEqual([...want].sort());
+    expect(run(db, filter, [BOB], true, 1_000)).toEqual([]);
+    const query = buildFilterQuery(filter, { limit: 250, now: 1, recipients: [ALICE], tagIndexReady: true })!;
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...query.bindings) as Array<{ detail: string }>)
+      .map(row => row.detail).join('\n');
+    expect(plan).toContain('events_received_at_idx');
+  });
+
+  it('selects expired events in bounded batches', () => {
+    const expiredDb = database();
+    insert(expiredDb, events);
+    const rows = expiredDb.prepare(EXPIRED_EVENTS_BATCH_SQL).all(100, 5) as Array<{ id: string }>;
+    const expired = events.filter(event => { const at = expiresAt(event); return at !== null && at <= 100; });
+    expect(rows).toHaveLength(Math.min(5, expired.length));
+    expect(rows.every(row => expired.some(event => event.id === row.id))).toBe(true);
   });
 
   it('uses exact matches for full-length ids and authors', () => {
