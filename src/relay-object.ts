@@ -18,6 +18,7 @@ import {
   verifyEvent,
 } from './nostr';
 import { evaluateRead, evaluateWrite } from './policy';
+import { buildFilterQuery, giftWrapVisible } from './query';
 import type {
   AppRecord,
   Env,
@@ -45,6 +46,8 @@ const DEFAULT_SETTINGS: RelaySettings = {
 const ACCESS_MODES = new Set(['public', 'app', 'user', 'app_or_user', 'app_and_user']);
 const APP_TYPES = new Set(['web', 'native', 'service']);
 const encoder = new TextEncoder();
+const TAG_BACKFILL_BATCH = 2000;
+const TAG_BACKFILL_DELAY_MS = 10_000;
 
 type SqlRow = Record<string, SqlStorageValue>;
 
@@ -154,6 +157,7 @@ function formatDecision(prefix: string | undefined, reason: string | undefined):
 
 export class RelayDurableObject extends DurableObject<Env> {
   private sql: SqlStorage;
+  private tagIndexReady = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -239,6 +243,10 @@ export class RelayDurableObject extends DurableObject<Env> {
         last_write_at INTEGER
       );
       INSERT OR IGNORE INTO relay_metrics(id) VALUES(1);
+      CREATE TABLE IF NOT EXISTS relay_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
 
     const eventColumns = this.sql.exec('PRAGMA table_info(events)').toArray() as SqlRow[];
@@ -247,9 +255,62 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
     this.sql.exec('CREATE INDEX IF NOT EXISTS events_received_at_idx ON events(received_at DESC, id ASC)');
 
+    // Tag queries walk (name, value, created_at) newest first instead of
+    // scanning every event in the time window. Rows written before this
+    // column existed are filled in small batches by alarm().
+    const tagColumns = this.sql.exec('PRAGMA table_info(event_tags)').toArray() as SqlRow[];
+    if (!tagColumns.some(column => String(column.name) === 'created_at')) {
+      this.sql.exec('ALTER TABLE event_tags ADD COLUMN created_at INTEGER');
+      const maxRow = this.sql.exec('SELECT COALESCE(MAX(rowid), 0) AS max FROM event_tags').toArray() as SqlRow[];
+      this.setMeta('tag_backfill_until', String(Number(maxRow[0]?.max ?? 0)));
+      this.setMeta('tag_backfill_cursor', '0');
+    }
+    this.sql.exec('CREATE INDEX IF NOT EXISTS event_tags_time_idx ON event_tags(name, value, created_at DESC, event_id ASC)');
+    this.tagIndexReady = this.getMeta('tag_backfill_until') === null;
+    if (!this.tagIndexReady) void this.ensureTagBackfillAlarm();
+
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
       this.sql.exec('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)', key, JSON.stringify(value));
     }
+  }
+
+  private getMeta(key: string): string | null {
+    const rows = this.sql.exec('SELECT value FROM relay_meta WHERE key = ?', key).toArray() as SqlRow[];
+    return rows.length ? String(rows[0].value) : null;
+  }
+
+  private setMeta(key: string, value: string): void {
+    this.sql.exec('INSERT INTO relay_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', key, value);
+  }
+
+  private async ensureTagBackfillAlarm(): Promise<void> {
+    if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+  }
+
+  /** Fills event_tags.created_at for rows stored before the column existed. */
+  async alarm(): Promise<void> {
+    const untilMeta = this.getMeta('tag_backfill_until');
+    if (untilMeta === null) return;
+    const until = Number(untilMeta);
+    const cursor = Number(this.getMeta('tag_backfill_cursor') ?? 0);
+    const next = Math.min(until, cursor + TAG_BACKFILL_BATCH);
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `UPDATE event_tags SET created_at = (SELECT e.created_at FROM events e WHERE e.id = event_tags.event_id)
+         WHERE rowid > ? AND rowid <= ? AND created_at IS NULL`,
+        cursor, next,
+      );
+      if (next >= until) {
+        this.sql.exec("DELETE FROM relay_meta WHERE key IN ('tag_backfill_until', 'tag_backfill_cursor')");
+      } else {
+        this.setMeta('tag_backfill_cursor', String(next));
+      }
+    });
+    if (next >= until) {
+      this.tagIndexReady = true;
+      return;
+    }
+    await this.ctx.storage.setAlarm(Date.now() + TAG_BACKFILL_DELAY_MS);
   }
 
   private getSettings(): RelaySettings {
@@ -638,7 +699,8 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
 
     const typedFilters = filters as NostrFilter[];
-    const decision = evaluateRead(settings, this.accessContext(session), typedFilters);
+    const ctx = this.accessContext(session);
+    const decision = evaluateRead(settings, ctx, typedFilters);
     if (!decision.allowed) {
       this.recordRead(0, true);
       ws.send(JSON.stringify(['CLOSED', subId, formatDecision(decision.prefix, decision.reason)]));
@@ -647,7 +709,7 @@ export class RelayDurableObject extends DurableObject<Env> {
 
     const events = new Map<string, NostrEvent>();
     for (const filter of typedFilters) {
-      for (const event of this.queryFilter(filter, settings)) events.set(event.id, event);
+      for (const event of this.queryFilter(filter, settings, ctx.authenticatedPubkeys)) events.set(event.id, event);
     }
     const ordered = [...events.values()].sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id));
     this.recordRead(ordered.length, false);
@@ -666,46 +728,16 @@ export class RelayDurableObject extends DurableObject<Env> {
     this.saveSession(ws, session);
   }
 
-  private queryFilter(filter: NostrFilter, settings: RelaySettings): NostrEvent[] {
-    const termCount = (filter.ids?.length ?? 0) + (filter.authors?.length ?? 0) + (filter.kinds?.length ?? 0) +
-      Object.entries(filter).filter(([k]) => k.startsWith('#')).reduce((sum, [, value]) => sum + ((value as string[]).length ?? 0), 0);
-    if (termCount > 80) return [];
-
-    const where: string[] = ['(e.expires_at IS NULL OR e.expires_at > ?)'];
-    const bindings: SqlStorageValue[] = [Math.floor(Date.now() / 1000)];
-
-    if (filter.ids?.length) {
-      where.push(`(${filter.ids.map(() => 'e.id LIKE ?').join(' OR ')})`);
-      bindings.push(...filter.ids.map(v => `${v}%`));
-    }
-    if (filter.authors?.length) {
-      where.push(`(${filter.authors.map(() => 'e.pubkey LIKE ?').join(' OR ')})`);
-      bindings.push(...filter.authors.map(v => `${v}%`));
-    }
-    if (filter.kinds?.length) {
-      where.push(`e.kind IN (${filter.kinds.map(() => '?').join(',')})`);
-      bindings.push(...filter.kinds);
-    }
-    if (filter.since !== undefined) { where.push('e.created_at >= ?'); bindings.push(filter.since); }
-    if (filter.until !== undefined) { where.push('e.created_at <= ?'); bindings.push(filter.until); }
-
-    for (const [key, raw] of Object.entries(filter)) {
-      if (!key.startsWith('#')) continue;
-      const values = raw as string[];
-      if (!values.length) return [];
-      where.push(`EXISTS (SELECT 1 FROM event_tags t WHERE t.event_id = e.id AND t.name = ? AND t.value IN (${values.map(() => '?').join(',')}))`);
-      bindings.push(key.slice(1), ...values);
-    }
-
+  private queryFilter(filter: NostrFilter, settings: RelaySettings, recipients: string[]): NostrEvent[] {
     const requested = filter.limit ?? settings.default_limit;
-    const limit = Math.max(0, Math.min(requested, settings.max_limit));
-    if (limit === 0) return [];
-    bindings.push(limit);
-    const rows = this.sql.exec(
-      `SELECT e.* FROM events e WHERE ${where.join(' AND ')} ORDER BY e.created_at DESC, e.id ASC LIMIT ?`,
-      ...bindings,
-    ).toArray() as SqlRow[];
-    return rows.map(eventFromRow);
+    const query = buildFilterQuery(filter, {
+      limit: Math.max(0, Math.min(requested, settings.max_limit)),
+      now: Math.floor(Date.now() / 1000),
+      recipients,
+      tagIndexReady: this.tagIndexReady,
+    });
+    if (!query) return [];
+    return (this.sql.exec(query.sql, ...query.bindings).toArray() as SqlRow[]).map(eventFromRow);
   }
 
   private async handleEvent(ws: WebSocket, msg: unknown[], bytes: number): Promise<void> {
@@ -814,7 +846,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       );
       for (const tag of event.tags) {
         if (tag.length < 2 || tag[0].length !== 1 || !/^[A-Za-z]$/.test(tag[0])) continue;
-        this.sql.exec('INSERT OR IGNORE INTO event_tags(event_id,name,value) VALUES(?,?,?)', event.id, tag[0], tag[1]);
+        this.sql.exec('INSERT OR IGNORE INTO event_tags(event_id,name,value,created_at) VALUES(?,?,?,?)', event.id, tag[0], tag[1], event.created_at);
       }
     });
     return true;
@@ -848,6 +880,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       // Read access was checked at REQ time. App sessions expire and admins can
       // disable apps or users since then, so re-check before every live delivery.
       const ctx = this.accessContext(session);
+      if (!giftWrapVisible(event, ctx.authenticatedPubkeys)) continue;
       let revoked = false;
       for (const [subId, filters] of matching) {
         const decision = evaluateRead(settings, ctx, filters);
