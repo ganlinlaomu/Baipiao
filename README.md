@@ -118,6 +118,8 @@ Current first release advertises:
 
 NIP-01 replaceable, ephemeral, and addressable event storage semantics are implemented. Generic event kinds used by features such as NIP-51 or NIP-59 do not require special relay-side code and can be stored subject to owner policy.
 
+NIP-59 gift wraps (kind 1059) are served only to a connection authenticated as one of the wrap's `p` recipients, through NIP-42 or an app session subject. Content is encrypted, but who receives wraps, how many, and when would otherwise be visible to every reader.
+
 ## Free-tier protections
 
 The relay defaults to conservative limits:
@@ -132,6 +134,10 @@ The relay defaults to conservative limits:
 - default write rate: 120 events/minute per connection
 
 These can be adjusted in `/admin` within hard safety bounds.
+
+Queries are planned to keep Durable Object SQLite rows-read low:
+- Full-length ids and authors use exact index lookups.
+- A single tag value (for example `#p` for a recipient's inbox) walks the `(name, value, created_at)` tag index newest first, so a page reads roughly `limit` rows instead of every event in the time window.
 
 ## Local development
 
@@ -183,7 +189,8 @@ The Worker routes all relay traffic to the Durable Object named `primary`. This 
 SQLite tables are created automatically inside the Durable Object:
 
 - `events`
-- `event_tags`
+- `event_tags` (with `created_at`, backfilled in batches by an alarm after upgrading)
+- `relay_meta`
 - `applications`
 - `app_sessions`
 - `users`
