@@ -73,7 +73,7 @@ Content-Type: application/json
 {"subject":"<optional 64-char nostr pubkey>","ttl":600}
 ```
 
-The response contains a short-lived `nrs_...` session token. If `subject` is supplied, that verified user identity is bound to the session for the session lifetime.
+`ttl` is in seconds, from 60 to 86400 (one day); the default is 600. The response contains a short-lived `nrs_...` session token. If `subject` is supplied, that verified user identity is bound to the session for the session lifetime.
 
 Browser/PWA clients then connect with the short-lived token:
 
