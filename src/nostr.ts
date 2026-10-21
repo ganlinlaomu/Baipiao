@@ -65,6 +65,7 @@ export function isValidFilter(value: unknown): value is NostrFilter {
   if (filter.since !== undefined && !Number.isInteger(filter.since)) return false;
   if (filter.until !== undefined && !Number.isInteger(filter.until)) return false;
   if (filter.limit !== undefined && (!Number.isInteger(filter.limit) || (filter.limit as number) < 0)) return false;
+  if (filter.received_since !== undefined && (!Number.isInteger(filter.received_since) || (filter.received_since as number) < 0)) return false;
   for (const [key, val] of Object.entries(filter)) {
     if (key.startsWith('#')) {
       if (key.length !== 2 || !/^[A-Za-z]$/.test(key.slice(1)) || !Array.isArray(val) || !val.every(v => typeof v === 'string')) return false;

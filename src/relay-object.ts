@@ -18,7 +18,7 @@ import {
   verifyEvent,
 } from './nostr';
 import { evaluateRead, evaluateWrite } from './policy';
-import { buildFilterQuery, giftWrapVisible } from './query';
+import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible } from './query';
 import type {
   AppRecord,
   Env,
@@ -48,6 +48,8 @@ const APP_TYPES = new Set(['web', 'native', 'service']);
 const encoder = new TextEncoder();
 const TAG_BACKFILL_BATCH = 2000;
 const TAG_BACKFILL_DELAY_MS = 10_000;
+const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60_000;
+const EXPIRED_PURGE_BATCH = 500;
 
 type SqlRow = Record<string, SqlStorageValue>;
 
@@ -267,7 +269,9 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
     this.sql.exec('CREATE INDEX IF NOT EXISTS event_tags_time_idx ON event_tags(name, value, created_at DESC, event_id ASC)');
     this.tagIndexReady = this.getMeta('tag_backfill_until') === null;
-    if (!this.tagIndexReady) void this.ensureTagBackfillAlarm();
+    // Only events carrying a NIP-40 expiration are indexed for the purge.
+    this.sql.exec('CREATE INDEX IF NOT EXISTS events_expires_idx ON events(expires_at) WHERE expires_at IS NOT NULL');
+    void this.ensureAlarm();
 
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
       this.sql.exec('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)', key, JSON.stringify(value));
@@ -283,14 +287,54 @@ export class RelayDurableObject extends DurableObject<Env> {
     this.sql.exec('INSERT INTO relay_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', key, value);
   }
 
-  private async ensureTagBackfillAlarm(): Promise<void> {
+  private async ensureAlarm(): Promise<void> {
     if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + 1_000);
   }
 
-  /** Fills event_tags.created_at for rows stored before the column existed. */
+  /** Tag index backfill while pending, then periodic purge of expired data. */
   async alarm(): Promise<void> {
+    if (!this.tagIndexReady && !this.backfillTagTimes()) {
+      await this.ctx.storage.setAlarm(Date.now() + TAG_BACKFILL_DELAY_MS);
+      return;
+    }
+    const more = this.purgeExpired();
+    await this.ctx.storage.setAlarm(Date.now() + (more ? 60_000 : MAINTENANCE_INTERVAL_MS));
+  }
+
+  /**
+   * NIP-40 expired events were only hidden from queries and app sessions were
+   * only pruned when a new one was issued; both stayed in storage. Returns
+   * true when more expired events remain.
+   */
+  private purgeExpired(): boolean {
+    const now = Math.floor(Date.now() / 1000);
+    // A subquery instead of an id list keeps the statement under the bound
+    // parameter limit; both deletes select the same index-ordered batch.
+    const batch = EXPIRED_EVENTS_BATCH_SQL;
+    const expired = Number((this.sql.exec(`SELECT COUNT(*) AS count FROM (${batch})`, now, EXPIRED_PURGE_BATCH).toArray() as SqlRow[])[0]?.count ?? 0);
+    this.ctx.storage.transactionSync(() => {
+      if (expired) {
+        this.sql.exec(`DELETE FROM event_tags WHERE event_id IN (${batch})`, now, EXPIRED_PURGE_BATCH);
+        this.sql.exec(`DELETE FROM events WHERE id IN (${batch})`, now, EXPIRED_PURGE_BATCH);
+      }
+      this.sql.exec('DELETE FROM app_sessions WHERE expires_at <= ?', now);
+    });
+    return expired === EXPIRED_PURGE_BATCH;
+  }
+
+  private deleteEvents(ids: string[]): void {
+    const placeholders = ids.map(() => '?').join(',');
+    this.sql.exec(`DELETE FROM event_tags WHERE event_id IN (${placeholders})`, ...ids);
+    this.sql.exec(`DELETE FROM events WHERE id IN (${placeholders})`, ...ids);
+  }
+
+  /** Fills event_tags.created_at for rows stored before the column existed. Returns true when done. */
+  private backfillTagTimes(): boolean {
     const untilMeta = this.getMeta('tag_backfill_until');
-    if (untilMeta === null) return;
+    if (untilMeta === null) {
+      this.tagIndexReady = true;
+      return true;
+    }
     const until = Number(untilMeta);
     const cursor = Number(this.getMeta('tag_backfill_cursor') ?? 0);
     const next = Math.min(until, cursor + TAG_BACKFILL_BATCH);
@@ -306,11 +350,8 @@ export class RelayDurableObject extends DurableObject<Env> {
         this.setMeta('tag_backfill_cursor', String(next));
       }
     });
-    if (next >= until) {
-      this.tagIndexReady = true;
-      return;
-    }
-    await this.ctx.storage.setAlarm(Date.now() + TAG_BACKFILL_DELAY_MS);
+    if (next >= until) this.tagIndexReady = true;
+    return this.tagIndexReady;
   }
 
   private getSettings(): RelaySettings {
@@ -335,6 +376,8 @@ export class RelayDurableObject extends DurableObject<Env> {
       software: 'https://github.com/ganlinlaomu/Baipiao',
       version: '0.1.0',
       supported_nips: [1, 9, 11, 40, 42],
+      // Filter extension: see NostrFilter.received_since.
+      received_since: true,
       limitation: {
         auth_required: authRequired,
         restricted_writes: settings.write_policy !== 'public',
@@ -835,7 +878,8 @@ export class RelayDurableObject extends DurableObject<Env> {
         const currentCreated = Number(current.created_at);
         const currentId = String(current.id);
         if (currentCreated > event.created_at || (currentCreated === event.created_at && currentId.localeCompare(event.id) < 0)) return false;
-        this.sql.exec('DELETE FROM events WHERE pubkey = ? AND kind = ? AND d_tag = ?', event.pubkey, event.kind, isParameterizedReplaceableKind(event.kind) ? dTag : '');
+        const replaced = (this.sql.exec('SELECT id FROM events WHERE pubkey = ? AND kind = ? AND d_tag = ?', event.pubkey, event.kind, isParameterizedReplaceableKind(event.kind) ? dTag : '').toArray() as SqlRow[]).map(row => String(row.id));
+        if (replaced.length) this.deleteEvents(replaced);
       }
     }
 
@@ -856,7 +900,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     for (const tag of event.tags) {
       if (tag[0] === 'e' && tag[1]) {
         const rows = this.sql.exec('SELECT pubkey, kind FROM events WHERE id = ? LIMIT 1', tag[1]).toArray() as SqlRow[];
-        if (rows.length && String(rows[0].pubkey) === event.pubkey && Number(rows[0].kind) !== 5) this.sql.exec('DELETE FROM events WHERE id = ?', tag[1]);
+        if (rows.length && String(rows[0].pubkey) === event.pubkey && Number(rows[0].kind) !== 5) this.deleteEvents([tag[1]]);
       }
       if (tag[0] === 'a' && tag[1]) {
         const parts = tag[1].split(':');
@@ -865,7 +909,8 @@ export class RelayDurableObject extends DurableObject<Env> {
         const pubkey = parts[1];
         const dTag = parts.slice(2).join(':');
         if (!Number.isInteger(kind) || pubkey !== event.pubkey) continue;
-        this.sql.exec('DELETE FROM events WHERE pubkey = ? AND kind = ? AND d_tag = ? AND created_at <= ? AND kind != 5', pubkey, kind, dTag, event.created_at);
+        const deleted = (this.sql.exec('SELECT id FROM events WHERE pubkey = ? AND kind = ? AND d_tag = ? AND created_at <= ? AND kind != 5', pubkey, kind, dTag, event.created_at).toArray() as SqlRow[]).map(row => String(row.id));
+        if (deleted.length) this.deleteEvents(deleted);
       }
     }
   }

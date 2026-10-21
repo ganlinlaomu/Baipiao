@@ -23,6 +23,12 @@ export interface NostrFilter {
   since?: number;
   until?: number;
   limit?: number;
+  /**
+   * Extension: only events this relay stored at or after this time (seconds).
+   * Lets a client fetch just what arrived since its last sync instead of
+   * re-reading the NIP-59 backdating window. Advertised in NIP-11.
+   */
+  received_since?: number;
   [key: `#${string}`]: unknown;
 }
 
