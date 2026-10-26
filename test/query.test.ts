@@ -20,11 +20,12 @@ function database() {
     CREATE INDEX events_received_at_idx ON events(received_at DESC, id ASC);
     CREATE INDEX events_expires_idx ON events(expires_at) WHERE expires_at IS NOT NULL;
     CREATE TABLE event_tags (
-      event_id TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, created_at INTEGER,
+      event_id TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, created_at INTEGER, received_at INTEGER,
       PRIMARY KEY(event_id, name, value)
     );
     CREATE INDEX event_tags_lookup_idx ON event_tags(name, value, event_id);
     CREATE INDEX event_tags_time_idx ON event_tags(name, value, created_at DESC, event_id ASC);
+    CREATE INDEX event_tags_received_time_idx ON event_tags(name, value, received_at DESC, event_id ASC);
   `);
   return db;
 }
@@ -58,15 +59,15 @@ const expiresAt = (event: NostrEvent) => parseInt(event.id.slice(-4), 16) % 10 =
 
 function insert(db: DatabaseSync, events: NostrEvent[]) {
   const insertEvent = db.prepare('INSERT INTO events(id,pubkey,created_at,received_at,kind,content,sig,tags_json,expires_at) VALUES(?,?,?,?,?,?,?,?,?)');
-  const insertTag = db.prepare('INSERT OR IGNORE INTO event_tags(event_id,name,value,created_at) VALUES(?,?,?,?)');
+  const insertTag = db.prepare('INSERT OR IGNORE INTO event_tags(event_id,name,value,created_at,received_at) VALUES(?,?,?,?,?)');
   for (const event of events) {
     insertEvent.run(event.id, event.pubkey, event.created_at, receivedAt(event), event.kind, event.content, event.sig, JSON.stringify(event.tags), expiresAt(event));
-    for (const tag of event.tags) insertTag.run(event.id, tag[0], tag[1], event.created_at);
+    for (const tag of event.tags) insertTag.run(event.id, tag[0], tag[1], event.created_at, receivedAt(event));
   }
 }
 
-function run(db: DatabaseSync, filter: NostrFilter, recipients: string[], tagIndexReady = true, limit = filter.limit ?? 250) {
-  const query = buildFilterQuery(filter, { limit, now: 1, recipients, tagIndexReady });
+function run(db: DatabaseSync, filter: NostrFilter, recipients: string[], tagIndexReady = true, limit = filter.limit ?? 250, recipientTimeIndexReady = false) {
+  const query = buildFilterQuery(filter, { limit, now: 1, recipients, tagIndexReady, recipientTimeIndexReady });
   if (!query) return [];
   return (db.prepare(query.sql).all(...query.bindings) as Array<{ id: string }>).map(row => row.id);
 }
@@ -145,6 +146,29 @@ describe('filter queries', () => {
     const plan = (db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...query.bindings) as Array<{ detail: string }>)
       .map(row => row.detail).join('\n');
     expect(plan).toContain('events_received_at_idx');
+  });
+
+  it('optimizes NIP-17 arrival queries with no changes to their result ordering or permissions', () => {
+    const filter = { kinds: [GIFT_WRAP_KIND], '#p': [ALICE], received_since: 20_350, limit: 250 };
+    const legacy = run(db, filter, [ALICE], true, 250, false);
+    const optimized = run(db, filter, [ALICE], true, 250, true);
+    expect(optimized).toEqual(legacy);
+    expect(run(db, filter, [BOB], true, 250, true)).toEqual([]);
+    expect(run(db, filter, [], true, 250, true)).toEqual([]);
+
+    const query = buildFilterQuery(filter, {
+      limit: 250, now: 1, recipients: [ALICE], tagIndexReady: true, recipientTimeIndexReady: true
+    })!;
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...query.bindings) as Array<{ detail: string }>)
+      .map(row => row.detail).join('\n');
+    expect(plan).toContain('event_tags_received_time_idx');
+    expect(plan).not.toMatch(/SCAN e\\b/);
+    expect(plan).not.toContain('TEMP B-TREE FOR ORDER BY');
+
+    const multi = buildFilterQuery({ '#p': [ALICE, BOB], received_since: 20_350 }, {
+      limit: 250, now: 1, recipients: [ALICE], tagIndexReady: true, recipientTimeIndexReady: true
+    })!;
+    expect(multi.sql).toContain('events_received_at_idx');
   });
 
   it('selects expired events in bounded batches', () => {
