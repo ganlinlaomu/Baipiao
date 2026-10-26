@@ -32,6 +32,12 @@ After deployment:
 4. Add your first application and copy its token. The raw token is shown only once.
 5. Optionally add Nostr users by `npub` or hex pubkey.
 
+## Liveness, readiness, and performance
+
+- `GET /health` is Worker liveness only and does **not** check the database.
+- `GET /ready` probes the Relay Durable Object and SQLite. It reports whether the tag-time and recipient-time indexes are ready (a recipient index may still be backfilling after upgrade). HTTP 503 indicates unavailable storage/DO.
+- The admin activity dashboard reports the latest 128 samples of REQ-to-EOSE, SQLite query latency, EVENT-to-OK, and average SQLite rows read. These metrics live **only in memory**, reset when the Durable Object hibernates or restarts, and do not add persistent writes. They are not lifetime percentiles or end-to-end delivery timings.
+
 ## Admin activity dashboard
 
 The `/admin` dashboard includes live and cumulative relay activity: active WebSocket connections, active subscriptions, active short-lived app sessions, stored event count, database size, read requests/events/denials, write attempts/accepted/denied, last read/write timestamps, and the 20 most recent stored events. Each recent stored event shows both the relay `received_at` timestamp and the signed Nostr event `created_at` timestamp. Existing rows created before `received_at` was introduced remain null and are shown as `Legacy / unknown` rather than being assigned a fabricated receive time. Aggregate counters are stored in the Durable Object SQLite database so they survive hibernation and restarts.

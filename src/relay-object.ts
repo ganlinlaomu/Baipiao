@@ -19,6 +19,7 @@ import {
 } from './nostr';
 import { evaluateRead, evaluateWrite } from './policy';
 import { allowControlMessage, MAX_RELAY_FRAME_CHARS, MAX_CONTROL_FRAME_CHARS } from './controlLimits';
+import { PerformanceWindow } from './perfWindow';
 import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible, sessionMayReceiveGiftWrap } from './query';
 import type {
   AppRecord,
@@ -167,6 +168,7 @@ export class RelayDurableObject extends DurableObject<Env> {
   private sql: SqlStorage;
   private tagIndexReady = false;
   private recipientTimeIndexReady = false;
+  private readonly perfWindow = new PerformanceWindow();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -411,6 +413,18 @@ export class RelayDurableObject extends DurableObject<Env> {
       try { result[String(row.key)] = JSON.parse(String(row.value)); } catch { /* ignore invalid row */ }
     }
     return result as unknown as RelaySettings;
+  }
+
+  /** Real SQLite readiness (not just a Worker HTTP 200). No writes. */
+  async readiness() {
+    const result = this.sql.exec('SELECT 1 AS ok').one();
+    if (Number(result.ok) !== 1) throw new Error('sqlite_not_ready');
+    return {
+      ok: true,
+      database: 'sqlite',
+      tag_index_ready: this.tagIndexReady,
+      recipient_time_index_ready: this.recipientTimeIndexReady,
+    };
   }
 
   async relayInfo(): Promise<Record<string, unknown>> {
@@ -814,10 +828,12 @@ export class RelayDurableObject extends DurableObject<Env> {
       last_read_at: metrics.last_read_at === null || metrics.last_read_at === undefined ? null : Number(metrics.last_read_at),
       last_write_at: metrics.last_write_at === null || metrics.last_write_at === undefined ? null : Number(metrics.last_write_at),
       recent_writes: recentWrites,
+      diagnostic_window: this.perfWindow.snapshot(),
     };
   }
 
   private async handleReq(ws: WebSocket, msg: unknown[]): Promise<void> {
+    const startedAt = performance.now();
     const settings = this.getSettings();
     const subId = msg[1];
     const filters = msg.slice(2);
@@ -857,6 +873,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     this.recordRead(ordered.length, false);
     for (const event of ordered) ws.send(JSON.stringify(['EVENT', subId, event]));
     ws.send(JSON.stringify(['EOSE', subId]));
+    this.perfWindow.record('req', performance.now() - startedAt);
 
     session.subscriptions[subId] = typedFilters;
     this.saveSession(ws, session);
@@ -880,10 +897,15 @@ export class RelayDurableObject extends DurableObject<Env> {
       recipientTimeIndexReady: this.recipientTimeIndexReady,
     });
     if (!query) return [];
-    return (this.sql.exec(query.sql, ...query.bindings).toArray() as SqlRow[]).map(eventFromRow);
+    const startedAt = performance.now();
+    const cursor = this.sql.exec(query.sql, ...query.bindings);
+    const rows = cursor.toArray() as SqlRow[];
+    this.perfWindow.record('query', performance.now() - startedAt, cursor.rowsRead);
+    return rows.map(eventFromRow);
   }
 
   private async handleEvent(ws: WebSocket, msg: unknown[], bytes: number): Promise<void> {
+    const startedAt = performance.now();
     const settings = this.getSettings();
     const candidate = msg[1];
     const id = isValidEventShape(candidate) ? candidate.id : '';
@@ -956,6 +978,7 @@ export class RelayDurableObject extends DurableObject<Env> {
 
     this.recordWrite(true);
     ws.send(JSON.stringify(['OK', event.id, true, '']));
+    this.perfWindow.record('write', performance.now() - startedAt);
     this.broadcast(event);
   }
 

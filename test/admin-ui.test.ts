@@ -19,6 +19,15 @@ describe('admin UI', () => {
     expect(script).toContain('try{');
   });
 
+  it('shows bounded transient SQL/relay performance and clarifies hibernation resets', () => {
+    const script = adminScript();
+    expect(script).toContain('REQ p95');
+    expect(script).toContain('SQLite p95');
+    expect(script).toContain('EVENT→OK p95');
+    expect(script).toContain('avg_rows_read');
+    expect(script).toContain('resets after Durable Object hibernation');
+  });
+
   it('renders relay read/write activity without inline handlers', () => {
     const html = adminHtml();
     const script = adminScript();

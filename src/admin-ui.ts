@@ -81,7 +81,11 @@ function renderStats(stats){
     ['Write attempts / 写入请求',stats.write_attempts],
     ['Write accepted / 写入成功',stats.write_accepted],
     ['Write denied / 写入拒绝',stats.write_denied],
-    ['Database / 数据库',formatBytes(stats.database_bytes)]
+    ['Database / 数据库',formatBytes(stats.database_bytes)],
+    ['REQ p95 / 毫秒',stats.diagnostic_window?.req?.p95_ms ?? '—'],
+    ['SQLite p95 / 毫秒',stats.diagnostic_window?.query?.p95_ms ?? '—'],
+    ['EVENT→OK p95 / 毫秒',stats.diagnostic_window?.write?.p95_ms ?? '—'],
+    ['SQL avg rows read / 平均读取行',stats.diagnostic_window?.query?.avg_rows_read ?? '—']
   ];
   var root=$('stats');root.textContent='';
   cards.forEach(function(card){
@@ -90,7 +94,7 @@ function renderStats(stats){
     var value=document.createElement('div');value.className='stat-value';value.textContent=typeof card[1]==='number'?formatNumber(card[1]):String(card[1]||0);
     box.appendChild(label);box.appendChild(value);root.appendChild(box);
   });
-  $('activityMeta').textContent='Last read / 最后读取: '+formatTime(stats.last_read_at)+'  ·  Last write / 最后写入: '+formatTime(stats.last_write_at);
+  $('activityMeta').textContent='Last read / 最后读取: '+formatTime(stats.last_read_at)+'  ·  Last write / 最后写入: '+formatTime(stats.last_write_at)+'  ·  Performance: latest 128 samples per metric, resets after Durable Object hibernation';
   var tbody=$('recentWrites');tbody.textContent='';
   (stats.recent_writes||[]).forEach(function(item){
     var tr=document.createElement('tr');
