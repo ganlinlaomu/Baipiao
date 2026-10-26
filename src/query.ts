@@ -1,4 +1,4 @@
-import type { NostrEvent, NostrFilter } from './types';
+import type { NostrEvent, NostrFilter, SessionAttachment } from './types';
 
 export const GIFT_WRAP_KIND = 1059;
 const FULL_HEX = /^[0-9a-f]{64}$/;
@@ -29,6 +29,26 @@ export type QueryOptions = {
 export function giftWrapVisible(event: NostrEvent, recipients: string[]): boolean {
   if (event.kind !== GIFT_WRAP_KIND) return true;
   return event.tags.some(tag => tag[0] === 'p' && !!tag[1] && recipients.includes(tag[1]));
+}
+
+/**
+ * Cheap negative-only prefilter before walking a connection's subscriptions or
+ * looking up ACL rows. It never grants access: broadcast still checks the
+ * current app/user policy and giftWrapVisible() after this test.
+ */
+export function sessionMayReceiveGiftWrap(
+  event: NostrEvent,
+  session: SessionAttachment,
+  now = Math.floor(Date.now() / 1000),
+): boolean {
+  if (event.kind !== GIFT_WRAP_KIND) return true;
+  const recipients = new Set(session.authenticated_pubkeys);
+  if (session.app_id && session.app_session_pubkey
+    && typeof session.app_session_expires_at === 'number'
+    && session.app_session_expires_at > now) {
+    recipients.add(session.app_session_pubkey);
+  }
+  return event.tags.some(tag => tag[0] === 'p' && !!tag[1] && recipients.has(tag[1]));
 }
 
 // Full-length values use the primary key/indexes directly. LIKE is
