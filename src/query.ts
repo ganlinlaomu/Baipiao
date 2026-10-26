@@ -102,13 +102,20 @@ export function buildFilterQuery(filter: NostrFilter, options: QueryOptions): Fi
     : undefined;
   const driver = receiptRecipient || (options.tagIndexReady && !byReceipt
     ? tags.find(([, values]) => values.length === 1) : undefined);
+  // Follow-list timelines (authors + kinds): without this hint SQLite walks
+  // events_kind_created_idx through every event of that kind and filters by
+  // author afterwards. Only full-length authors are forced, since INDEXED BY
+  // errors out when the planner cannot use the index for GLOB prefixes.
+  const byAuthor = !filter.ids?.length && !!filter.authors?.length && !!filter.kinds?.length
+    && filter.authors.every(author => FULL_HEX.test(author));
   let from = 'events e';
   let order = 'e.created_at DESC, e.id ASC';
   if (receiptRecipient) {
-    from = 'event_tags t INDEXED BY event_tags_received_time_idx CROSS JOIN events e ON e.id = t.event_id';
+    // The partial index covers only `p` rows, so the name must be a literal.
+    from = 'event_tags t INDEXED BY event_tags_p_received_idx CROSS JOIN events e ON e.id = t.event_id';
     order = 't.received_at DESC, t.event_id ASC';
-    where.push('t.name = ?', 't.value = ?', 't.received_at >= ?');
-    bindings.push(receiptRecipient[0], receiptRecipient[1][0], filter.received_since!);
+    where.push("t.name = 'p'", 't.value = ?', 't.received_at >= ?');
+    bindings.push(receiptRecipient[1][0], filter.received_since!);
     if (filter.since !== undefined) { where.push('e.created_at >= ?'); bindings.push(filter.since); }
     if (filter.until !== undefined) { where.push('e.created_at <= ?'); bindings.push(filter.until); }
   } else if (byReceipt) {
@@ -126,6 +133,7 @@ export function buildFilterQuery(filter: NostrFilter, options: QueryOptions): Fi
     if (filter.since !== undefined) { where.push('t.created_at >= ?'); bindings.push(filter.since); }
     if (filter.until !== undefined) { where.push('t.created_at <= ?'); bindings.push(filter.until); }
   } else {
+    if (byAuthor) from = 'events e INDEXED BY events_author_kind_created_idx';
     if (filter.since !== undefined) { where.push('e.created_at >= ?'); bindings.push(filter.since); }
     if (filter.until !== undefined) { where.push('e.created_at <= ?'); bindings.push(filter.until); }
   }
@@ -160,4 +168,28 @@ export function buildFilterQuery(filter: NostrFilter, options: QueryOptions): Fi
     sql: `SELECT e.* FROM ${from} WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT ?`,
     bindings,
   };
+}
+
+export type StoredEventRow = {
+  id: SqlValue;
+  pubkey: SqlValue;
+  created_at: SqlValue;
+  kind: SqlValue;
+  tags_json: SqlValue;
+  content: SqlValue;
+  sig: SqlValue;
+};
+
+/**
+ * Event JSON built from a stored row without parsing tags_json back into
+ * objects: it was produced by JSON.stringify on insert, and id/pubkey/sig are
+ * validated lowercase hex, so only content needs escaping.
+ */
+export function storedEventJson(row: StoredEventRow): string {
+  return `{"id":"${row.id}","pubkey":"${row.pubkey}","created_at":${Number(row.created_at)},"kind":${Number(row.kind)},"tags":${row.tags_json},"content":${JSON.stringify(String(row.content))},"sig":"${row.sig}"}`;
+}
+
+/** Canonical event JSON; drops any extra fields a client attached. */
+export function eventJson(event: NostrEvent): string {
+  return storedEventJson({ ...event, tags_json: JSON.stringify(event.tags) });
 }
