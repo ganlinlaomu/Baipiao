@@ -19,7 +19,7 @@ import {
 } from './nostr';
 import { evaluateRead, evaluateWrite } from './policy';
 import { allowControlMessage, MAX_RELAY_FRAME_CHARS, MAX_CONTROL_FRAME_CHARS } from './controlLimits';
-import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible } from './query';
+import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible, sessionMayReceiveGiftWrap } from './query';
 import type {
   AppRecord,
   Env,
@@ -707,7 +707,10 @@ export class RelayDurableObject extends DurableObject<Env> {
     return rows.map(userFromRow);
   }
 
-  private accessContext(session: SessionAttachment): { app: AppRecord | null; users: UserRecord[]; authenticatedPubkeys: string[] } {
+  private accessContext(
+    session: SessionAttachment,
+    cache?: { apps: Map<string, AppRecord | null>; users: Map<string, UserRecord | null> },
+  ): { app: AppRecord | null; users: UserRecord[]; authenticatedPubkeys: string[] } {
     const now = Math.floor(Date.now() / 1000);
     const appSessionActive = !!session.app_id
       && typeof session.app_session_expires_at === 'number'
@@ -716,11 +719,30 @@ export class RelayDurableObject extends DurableObject<Env> {
     if (appSessionActive && session.app_session_pubkey && !authenticatedPubkeys.includes(session.app_session_pubkey)) {
       authenticatedPubkeys.push(session.app_session_pubkey);
     }
-    return {
-      app: appSessionActive ? this.getAppById(session.app_id) : null,
-      users: this.getUsers(authenticatedPubkeys),
-      authenticatedPubkeys,
-    };
+    let app: AppRecord | null = null;
+    if (appSessionActive && session.app_id) {
+      if (!cache) {
+        app = this.getAppById(session.app_id);
+      } else {
+        if (!cache.apps.has(session.app_id)) cache.apps.set(session.app_id, this.getAppById(session.app_id));
+        app = cache.apps.get(session.app_id) ?? null;
+      }
+    }
+    let users: UserRecord[];
+    if (!cache) {
+      users = this.getUsers(authenticatedPubkeys);
+    } else {
+      const missing = authenticatedPubkeys.filter(pubkey => !cache.users.has(pubkey));
+      if (missing.length) {
+        const found = new Map(this.getUsers(missing).map(user => [user.pubkey, user]));
+        for (const pubkey of missing) cache.users.set(pubkey, found.get(pubkey) ?? null);
+      }
+      users = authenticatedPubkeys.flatMap(pubkey => {
+        const user = cache.users.get(pubkey);
+        return user ? [user] : [];
+      });
+    }
+    return { app, users, authenticatedPubkeys };
   }
 
 
@@ -998,14 +1020,21 @@ export class RelayDurableObject extends DurableObject<Env> {
 
   private broadcast(event: NostrEvent): void {
     const settings = this.getSettings();
+    const now = Math.floor(Date.now() / 1000);
+    // Each broadcast is synchronous: memoization is valid only for this event
+    // and never survives policy edits or Durable Object hibernation.
+    const accessCache = {
+      apps: new Map<string, AppRecord | null>(),
+      users: new Map<string, UserRecord | null>(),
+    };
     for (const socket of this.ctx.getWebSockets()) {
       const session = socket.deserializeAttachment() as SessionAttachment | null;
-      if (!session) continue;
+      if (!session || !sessionMayReceiveGiftWrap(event, session, now)) continue;
       const matching = Object.entries(session.subscriptions ?? {}).filter(([, filters]) => filters.some(filter => eventMatchesFilter(event, filter)));
       if (!matching.length) continue;
       // Read access was checked at REQ time. App sessions expire and admins can
       // disable apps or users since then, so re-check before every live delivery.
-      const ctx = this.accessContext(session);
+      const ctx = this.accessContext(session, accessCache);
       if (!giftWrapVisible(event, ctx.authenticatedPubkeys)) continue;
       let revoked = false;
       for (const [subId, filters] of matching) {
