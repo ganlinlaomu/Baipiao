@@ -1,8 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { eventMatchesFilter } from '../src/nostr';
-import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible, GIFT_WRAP_KIND } from '../src/query';
-import type { NostrEvent, NostrFilter } from '../src/types';
+import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible, GIFT_WRAP_KIND, sessionMayReceiveGiftWrap } from '../src/query';
+import type { NostrEvent, NostrFilter, SessionAttachment } from '../src/types';
 
 // Mirrors the events/event_tags schema and indexes in relay-object.ts.
 function database() {
@@ -169,6 +169,22 @@ describe('filter queries', () => {
       limit: 250, now: 1, recipients: [ALICE], tagIndexReady: true, recipientTimeIndexReady: true
     })!;
     expect(multi.sql).toContain('events_received_at_idx');
+  });
+
+  it('prefilters unrelated gift wraps without bypassing NIP-42 and app-session expiry', () => {
+    const event = events.find(item => item.kind === GIFT_WRAP_KIND && item.tags[0][1] === ALICE)!;
+    const session = {
+      authenticated_pubkeys: [BOB], app_id: 'app', app_session_pubkey: ALICE,
+      app_session_expires_at: 200
+    } as SessionAttachment;
+    expect(sessionMayReceiveGiftWrap(event, session, 199)).toBe(true);
+    expect(sessionMayReceiveGiftWrap(event, session, 200)).toBe(false);
+    session.authenticated_pubkeys.push(ALICE);
+    expect(sessionMayReceiveGiftWrap(event, session, 200)).toBe(true);
+    session.authenticated_pubkeys = [BOB];
+    session.app_id = null;
+    expect(sessionMayReceiveGiftWrap(event, session, 199)).toBe(false);
+    expect(sessionMayReceiveGiftWrap({ ...event, kind: 1 }, session, 199)).toBe(true);
   });
 
   it('selects expired events in bounded batches', () => {
