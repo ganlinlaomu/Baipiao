@@ -15,11 +15,10 @@ export function allowControlMessage(
   at = Date.now(),
 ): boolean {
   const previous = session.control_windows?.[kind];
-  const reset = !previous || at < previous.startedAt || at - previous.startedAt >= 60_000;
-  const next = {
-    startedAt: reset ? at : previous.startedAt,
-    count: reset ? 1 : previous.count + 1,
-  };
+  const withinWindow = previous && at >= previous.startedAt && at - previous.startedAt < 60_000;
+  const next = withinWindow
+    ? { startedAt: previous.startedAt, count: previous.count + 1 }
+    : { startedAt: at, count: 1 };
   session.control_windows = { ...session.control_windows, [kind]: next };
   return next.count <= (kind === 'REQ' ? MAX_REQ_PER_MINUTE : MAX_AUTH_PER_MINUTE);
 }
