@@ -59,6 +59,23 @@ export default {
       return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
     }
 
+    // /health is a cheap Worker liveness check. /ready probes the actual
+    // Durable Object and SQLite, so monitoring can distinguish edge reachability
+    // from usable relay storage without modifying any user data.
+    if (url.pathname === '/ready' && request.method === 'GET') {
+      try {
+        const state = await stub.readiness();
+        return new Response(JSON.stringify(state), {
+          headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+        });
+      } catch {
+        return new Response(JSON.stringify({ ok: false, reason: 'relay_unavailable' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+        });
+      }
+    }
+
     if (url.pathname === '/admin' && request.method === 'GET') {
       return new Response(adminHtml(), {
         headers: {
