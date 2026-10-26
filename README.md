@@ -140,6 +140,8 @@ The relay defaults to conservative limits:
 These can be adjusted in `/admin` within hard safety bounds.
 
 Queries are planned to keep Durable Object SQLite rows-read low:
+- For authenticated NIP-17 `#p` + `received_since` requests, a recipient/arrival-time index avoids scanning every account's newly received events. The query stays on the legacy index until older tag rows have been backfilled.
+- Upgrades backfill old tag arrival times gradually (48 rows per 2-minute alarm) to protect free-tier write quotas. The new fast path is only enabled when backfill finishes; existing read behavior is preserved while it runs.
 - Full-length ids and authors use exact index lookups.
 - A single tag value (for example `#p` for a recipient's inbox) walks the `(name, value, created_at)` tag index newest first, so a page reads roughly `limit` rows instead of every event in the time window.
 

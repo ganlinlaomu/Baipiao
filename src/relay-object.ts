@@ -49,6 +49,10 @@ const APP_TYPES = new Set(['web', 'native', 'service']);
 const encoder = new TextEncoder();
 const MAX_APP_SESSION_TTL = 24 * 60 * 60;
 const TAG_BACKFILL_BATCH = 2000;
+// Keep new one-time index backfill comfortably below Workers Free daily
+// SQLite row-write limits; the original tag-created_at backfill is unchanged.
+const RECEIVED_TAG_BACKFILL_BATCH = 48;
+const RECEIVED_TAG_BACKFILL_DELAY_MS = 2 * 60_000;
 const TAG_BACKFILL_DELAY_MS = 10_000;
 const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60_000;
 const EXPIRED_PURGE_BATCH = 500;
@@ -162,6 +166,7 @@ function formatDecision(prefix: string | undefined, reason: string | undefined):
 export class RelayDurableObject extends DurableObject<Env> {
   private sql: SqlStorage;
   private tagIndexReady = false;
+  private recipientTimeIndexReady = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -231,6 +236,8 @@ export class RelayDurableObject extends DurableObject<Env> {
         event_id TEXT NOT NULL,
         name TEXT NOT NULL,
         value TEXT NOT NULL,
+        created_at INTEGER,
+        received_at INTEGER,
         PRIMARY KEY(event_id, name, value),
         FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
       );
@@ -271,6 +278,17 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
     this.sql.exec('CREATE INDEX IF NOT EXISTS event_tags_time_idx ON event_tags(name, value, created_at DESC, event_id ASC)');
     this.tagIndexReady = this.getMeta('tag_backfill_until') === null;
+    // Incrementally migrate legacy tag rows. Until complete, queries keep the
+    // existing events_received_at_idx plan; no incomplete result is returned.
+    const receivedColumns = this.sql.exec('PRAGMA table_info(event_tags)').toArray() as SqlRow[];
+    if (!receivedColumns.some(column => String(column.name) === 'received_at')) {
+      this.sql.exec('ALTER TABLE event_tags ADD COLUMN received_at INTEGER');
+      const maxRow = this.sql.exec('SELECT COALESCE(MAX(rowid), 0) AS max FROM event_tags').toArray() as SqlRow[];
+      this.setMeta('received_tag_backfill_until', String(Number(maxRow[0]?.max ?? 0)));
+      this.setMeta('received_tag_backfill_cursor', '0');
+    }
+    this.sql.exec('CREATE INDEX IF NOT EXISTS event_tags_received_time_idx ON event_tags(name, value, received_at DESC, event_id ASC)');
+    this.recipientTimeIndexReady = this.getMeta('received_tag_backfill_until') === null;
     // Only events carrying a NIP-40 expiration are indexed for the purge.
     this.sql.exec('CREATE INDEX IF NOT EXISTS events_expires_idx ON events(expires_at) WHERE expires_at IS NOT NULL');
     void this.ensureAlarm();
@@ -297,6 +315,10 @@ export class RelayDurableObject extends DurableObject<Env> {
   async alarm(): Promise<void> {
     if (!this.tagIndexReady && !this.backfillTagTimes()) {
       await this.ctx.storage.setAlarm(Date.now() + TAG_BACKFILL_DELAY_MS);
+      return;
+    }
+    if (!this.recipientTimeIndexReady && !this.backfillRecipientReceivedTimes()) {
+      await this.ctx.storage.setAlarm(Date.now() + RECEIVED_TAG_BACKFILL_DELAY_MS);
       return;
     }
     const more = this.purgeExpired();
@@ -354,6 +376,32 @@ export class RelayDurableObject extends DurableObject<Env> {
     });
     if (next >= until) this.tagIndexReady = true;
     return this.tagIndexReady;
+  }
+
+  /** Bounded backfill of previously stored event arrival timestamps. */
+  private backfillRecipientReceivedTimes(): boolean {
+    const marker = this.getMeta('received_tag_backfill_until');
+    if (marker === null) {
+      this.recipientTimeIndexReady = true;
+      return true;
+    }
+    const until = Number(marker);
+    const cursor = Number(this.getMeta('received_tag_backfill_cursor') ?? 0);
+    const next = Math.min(until, cursor + RECEIVED_TAG_BACKFILL_BATCH);
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `UPDATE event_tags SET received_at = (SELECT e.received_at FROM events e WHERE e.id = event_tags.event_id)
+         WHERE rowid > ? AND rowid <= ? AND received_at IS NULL`,
+        cursor, next,
+      );
+      if (next >= until) {
+        this.sql.exec("DELETE FROM relay_meta WHERE key IN ('received_tag_backfill_until', 'received_tag_backfill_cursor')");
+      } else {
+        this.setMeta('received_tag_backfill_cursor', String(next));
+      }
+    });
+    if (next >= until) this.recipientTimeIndexReady = true;
+    return this.recipientTimeIndexReady;
   }
 
   private getSettings(): RelaySettings {
@@ -807,6 +855,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       now: Math.floor(Date.now() / 1000),
       recipients,
       tagIndexReady: this.tagIndexReady,
+      recipientTimeIndexReady: this.recipientTimeIndexReady,
     });
     if (!query) return [];
     return (this.sql.exec(query.sql, ...query.bindings).toArray() as SqlRow[]).map(eventFromRow);
@@ -923,7 +972,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       );
     for (const tag of event.tags) {
       if (tag.length < 2 || tag[0].length !== 1 || !/^[A-Za-z]$/.test(tag[0])) continue;
-      this.sql.exec('INSERT OR IGNORE INTO event_tags(event_id,name,value,created_at) VALUES(?,?,?,?)', event.id, tag[0], tag[1], event.created_at);
+      this.sql.exec('INSERT OR IGNORE INTO event_tags(event_id,name,value,created_at,received_at) VALUES(?,?,?,?,?)', event.id, tag[0], tag[1], event.created_at, receivedAt);
     }
     return true;
   }
