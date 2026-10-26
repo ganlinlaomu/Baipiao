@@ -1,7 +1,16 @@
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { eventMatchesFilter } from '../src/nostr';
-import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible, GIFT_WRAP_KIND, sessionMayReceiveGiftWrap } from '../src/query';
+import {
+  buildFilterQuery,
+  eventJson,
+  EXPIRED_EVENTS_BATCH_SQL,
+  giftWrapVisible,
+  GIFT_WRAP_KIND,
+  sessionMayReceiveGiftWrap,
+  storedEventJson,
+  type StoredEventRow,
+} from '../src/query';
 import type { NostrEvent, NostrFilter, SessionAttachment } from '../src/types';
 
 // Mirrors the events/event_tags schema and indexes in relay-object.ts.
@@ -17,15 +26,15 @@ function database() {
     CREATE INDEX events_pubkey_created_idx ON events(pubkey, created_at DESC);
     CREATE INDEX events_kind_created_idx ON events(kind, created_at DESC);
     CREATE INDEX events_replaceable_idx ON events(pubkey, kind, d_tag, created_at DESC, id ASC);
+    CREATE INDEX events_author_kind_created_idx ON events(pubkey, kind, created_at DESC, id ASC);
     CREATE INDEX events_received_at_idx ON events(received_at DESC, id ASC);
     CREATE INDEX events_expires_idx ON events(expires_at) WHERE expires_at IS NOT NULL;
     CREATE TABLE event_tags (
       event_id TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, created_at INTEGER, received_at INTEGER,
       PRIMARY KEY(event_id, name, value)
     );
-    CREATE INDEX event_tags_lookup_idx ON event_tags(name, value, event_id);
     CREATE INDEX event_tags_time_idx ON event_tags(name, value, created_at DESC, event_id ASC);
-    CREATE INDEX event_tags_received_time_idx ON event_tags(name, value, received_at DESC, event_id ASC);
+    CREATE INDEX event_tags_p_received_idx ON event_tags(value, received_at DESC, event_id ASC) WHERE name = 'p';
   `);
   return db;
 }
@@ -91,6 +100,7 @@ describe('filter queries', () => {
     { '#p': [ALICE, BOB], limit: 120 },
     { '#p': [ALICE], '#e': [hex(9999)] },
     { kinds: [1], authors: [hex(1003)] },
+    { kinds: [1, GIFT_WRAP_KIND], authors: [hex(1001), hex(1004)], since: 9_850, limit: 20 },
     { authors: [hex(1003).slice(0, 62)], kinds: [1] },
     { ids: [hex(5), hex(42), hex(3).slice(0, 63)] },
     { kinds: [1], limit: 30 },
@@ -161,7 +171,7 @@ describe('filter queries', () => {
     })!;
     const plan = (db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...query.bindings) as Array<{ detail: string }>)
       .map(row => row.detail).join('\n');
-    expect(plan).toContain('event_tags_received_time_idx');
+    expect(plan).toContain('event_tags_p_received_idx');
     expect(plan).not.toMatch(/SCAN e\\b/);
     expect(plan).not.toContain('TEMP B-TREE FOR ORDER BY');
 
@@ -194,6 +204,32 @@ describe('filter queries', () => {
     const expired = events.filter(event => { const at = expiresAt(event); return at !== null && at <= 100; });
     expect(rows).toHaveLength(Math.min(5, expired.length));
     expect(rows.every(row => expired.some(event => event.id === row.id))).toBe(true);
+  });
+
+  it('walks the author index for follow-list timelines', () => {
+    const planFor = (filter: NostrFilter) => {
+      const query = buildFilterQuery(filter, { limit: 50, now: 1, recipients: [], tagIndexReady: true })!;
+      return (db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...query.bindings) as Array<{ detail: string }>)
+        .map(row => row.detail).join('\n');
+    };
+    const plan = planFor({ authors: [hex(1001), hex(1003)], kinds: [1] });
+    expect(plan).toContain('events_author_kind_created_idx');
+    expect(plan).not.toContain('events_kind_created_idx');
+    // Prefixes cannot be forced onto the index (INDEXED BY would fail to plan).
+    expect(planFor({ authors: [hex(1003).slice(0, 10)], kinds: [1] })).not.toContain('events_author_kind_created_idx');
+  });
+
+  it('serializes stored rows exactly like JSON.stringify of the event', () => {
+    const event: NostrEvent = {
+      id: hex(7), pubkey: hex(8), created_at: 1_700_000_000, kind: 1,
+      tags: [['p', ALICE, 'wss://r.example', 'say "hi"\n'], ['t', '海内\u2028']],
+      content: 'line\n"quoted" \\ \u0000 😀',
+      sig: '0'.repeat(128),
+    };
+    const row: StoredEventRow = { ...event, tags_json: JSON.stringify(event.tags) };
+    expect(storedEventJson(row)).toBe(JSON.stringify(event));
+    expect(JSON.parse(storedEventJson(row))).toEqual(event);
+    expect(eventJson({ ...event, extra: 'dropped' } as NostrEvent)).toBe(JSON.stringify(event));
   });
 
   it('uses exact matches for full-length ids and authors', () => {

@@ -20,7 +20,15 @@ import {
 import { evaluateRead, evaluateWrite } from './policy';
 import { allowControlMessage, MAX_RELAY_FRAME_CHARS, MAX_CONTROL_FRAME_CHARS } from './controlLimits';
 import { PerformanceWindow } from './perfWindow';
-import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible, sessionMayReceiveGiftWrap } from './query';
+import {
+  buildFilterQuery,
+  EXPIRED_EVENTS_BATCH_SQL,
+  eventJson,
+  giftWrapVisible,
+  sessionMayReceiveGiftWrap,
+  storedEventJson,
+  type StoredEventRow,
+} from './query';
 import type {
   AppRecord,
   Env,
@@ -57,6 +65,14 @@ const RECEIVED_TAG_BACKFILL_DELAY_MS = 2 * 60_000;
 const TAG_BACKFILL_DELAY_MS = 10_000;
 const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60_000;
 const EXPIRED_PURGE_BATCH = 500;
+// Bump when initializeSchema() gains a migration. A matching version lets a
+// woken Durable Object skip the whole idempotent setup batch.
+const SCHEMA_VERSION = 1;
+// Request counters are batched in memory and written once per burst instead
+// of once per REQ/EVENT: a write would hold every later ws.send behind the
+// output gate until storage confirms it, and spends the row-write quota.
+const METRICS_FLUSH_DELAY_MS = 5_000;
+const MAX_CACHED_USERS = 5_000;
 
 type SqlRow = Record<string, SqlStorageValue>;
 
@@ -126,15 +142,24 @@ function userFromRow(row: SqlRow): UserRecord {
   };
 }
 
-function eventFromRow(row: SqlRow): NostrEvent {
+type QueriedEvent = { id: string; created_at: number; json: string };
+
+type PendingMetrics = {
+  read_requests: number;
+  read_events: number;
+  read_denied: number;
+  write_attempts: number;
+  write_accepted: number;
+  write_denied: number;
+  last_read_at: number | null;
+  last_write_at: number | null;
+};
+
+function emptyMetrics(): PendingMetrics {
   return {
-    id: String(row.id),
-    pubkey: String(row.pubkey),
-    created_at: Number(row.created_at),
-    kind: Number(row.kind),
-    tags: JSON.parse(String(row.tags_json)),
-    content: String(row.content),
-    sig: String(row.sig),
+    read_requests: 0, read_events: 0, read_denied: 0,
+    write_attempts: 0, write_accepted: 0, write_denied: 0,
+    last_read_at: null, last_write_at: null,
   };
 }
 
@@ -169,17 +194,42 @@ export class RelayDurableObject extends DurableObject<Env> {
   private tagIndexReady = false;
   private recipientTimeIndexReady = false;
   private readonly perfWindow = new PerformanceWindow();
+  // Settings, apps and users only change through the admin API, which clears
+  // these and disconnects every socket (accessChanged), so no reader can keep
+  // acting on a stale grant.
+  private settingsCache: RelaySettings | null = null;
+  private readonly appCache = new Map<string, AppRecord | null>();
+  private readonly userCache = new Map<string, UserRecord | null>();
+  private pendingMetrics = emptyMetrics();
+  private metricsTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.initializeSchema();
+    this.sql.exec('PRAGMA foreign_keys = ON');
+    if (!this.loadSchemaState()) this.initializeSchema();
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
+  }
+
+  /** One read on wake: true when the schema is current and the index flags are loaded. */
+  private loadSchemaState(): boolean {
+    let rows: SqlRow[];
+    try {
+      rows = this.sql.exec(
+        "SELECT key, value FROM relay_meta WHERE key IN ('schema_version', 'tag_backfill_until', 'received_tag_backfill_until')",
+      ).toArray() as SqlRow[];
+    } catch {
+      return false; // relay_meta does not exist yet
+    }
+    const meta = new Map(rows.map(row => [String(row.key), String(row.value)]));
+    if (meta.get('schema_version') !== String(SCHEMA_VERSION)) return false;
+    this.tagIndexReady = !meta.has('tag_backfill_until');
+    this.recipientTimeIndexReady = !meta.has('received_tag_backfill_until');
+    return true;
   }
 
   private initializeSchema(): void {
     this.sql.exec(`
-      PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -234,6 +284,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS events_pubkey_created_idx ON events(pubkey, created_at DESC);
       CREATE INDEX IF NOT EXISTS events_kind_created_idx ON events(kind, created_at DESC);
       CREATE INDEX IF NOT EXISTS events_replaceable_idx ON events(pubkey, kind, d_tag, created_at DESC, id ASC);
+      CREATE INDEX IF NOT EXISTS events_author_kind_created_idx ON events(pubkey, kind, created_at DESC, id ASC);
       CREATE TABLE IF NOT EXISTS event_tags (
         event_id TEXT NOT NULL,
         name TEXT NOT NULL,
@@ -243,7 +294,8 @@ export class RelayDurableObject extends DurableObject<Env> {
         PRIMARY KEY(event_id, name, value),
         FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
       );
-      CREATE INDEX IF NOT EXISTS event_tags_lookup_idx ON event_tags(name, value, event_id);
+      -- Superseded: EXISTS lookups use the primary key, tag queries event_tags_time_idx.
+      DROP INDEX IF EXISTS event_tags_lookup_idx;
       CREATE TABLE IF NOT EXISTS relay_metrics (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         read_requests INTEGER NOT NULL DEFAULT 0,
@@ -289,7 +341,9 @@ export class RelayDurableObject extends DurableObject<Env> {
       this.setMeta('received_tag_backfill_until', String(Number(maxRow[0]?.max ?? 0)));
       this.setMeta('received_tag_backfill_cursor', '0');
     }
-    this.sql.exec('CREATE INDEX IF NOT EXISTS event_tags_received_time_idx ON event_tags(name, value, received_at DESC, event_id ASC)');
+    // Only `p` recipients are queried by arrival time; other tags need no entry.
+    this.sql.exec('DROP INDEX IF EXISTS event_tags_received_time_idx');
+    this.sql.exec("CREATE INDEX IF NOT EXISTS event_tags_p_received_idx ON event_tags(value, received_at DESC, event_id ASC) WHERE name = 'p'");
     this.recipientTimeIndexReady = this.getMeta('received_tag_backfill_until') === null;
     // Only events carrying a NIP-40 expiration are indexed for the purge.
     this.sql.exec('CREATE INDEX IF NOT EXISTS events_expires_idx ON events(expires_at) WHERE expires_at IS NOT NULL');
@@ -298,6 +352,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
       this.sql.exec('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)', key, JSON.stringify(value));
     }
+    this.setMeta('schema_version', String(SCHEMA_VERSION));
   }
 
   private getMeta(key: string): string | null {
@@ -315,16 +370,17 @@ export class RelayDurableObject extends DurableObject<Env> {
 
   /** Tag index backfill while pending, then periodic purge of expired data. */
   async alarm(): Promise<void> {
-    if (!this.tagIndexReady && !this.backfillTagTimes()) {
-      await this.ctx.storage.setAlarm(Date.now() + TAG_BACKFILL_DELAY_MS);
-      return;
+    // ensureAlarm() only runs on a schema migration, so the alarm must always
+    // reschedule itself, even when a step throws.
+    let delay = MAINTENANCE_INTERVAL_MS;
+    try {
+      this.flushMetrics();
+      if (!this.tagIndexReady && !this.backfillTagTimes()) delay = TAG_BACKFILL_DELAY_MS;
+      else if (!this.recipientTimeIndexReady && !this.backfillRecipientReceivedTimes()) delay = RECEIVED_TAG_BACKFILL_DELAY_MS;
+      else if (this.purgeExpired()) delay = 60_000;
+    } finally {
+      await this.ctx.storage.setAlarm(Date.now() + delay);
     }
-    if (!this.recipientTimeIndexReady && !this.backfillRecipientReceivedTimes()) {
-      await this.ctx.storage.setAlarm(Date.now() + RECEIVED_TAG_BACKFILL_DELAY_MS);
-      return;
-    }
-    const more = this.purgeExpired();
-    await this.ctx.storage.setAlarm(Date.now() + (more ? 60_000 : MAINTENANCE_INTERVAL_MS));
   }
 
   /**
@@ -407,12 +463,14 @@ export class RelayDurableObject extends DurableObject<Env> {
   }
 
   private getSettings(): RelaySettings {
+    if (this.settingsCache) return this.settingsCache;
     const rows = this.sql.exec('SELECT key, value FROM settings').toArray() as SqlRow[];
     const result = { ...DEFAULT_SETTINGS } as Record<string, unknown>;
     for (const row of rows) {
       try { result[String(row.key)] = JSON.parse(String(row.value)); } catch { /* ignore invalid row */ }
     }
-    return result as unknown as RelaySettings;
+    this.settingsCache = Object.freeze(result) as unknown as RelaySettings;
+    return this.settingsCache;
   }
 
   /** Real SQLite readiness (not just a Worker HTTP 200). No writes. */
@@ -658,6 +716,7 @@ export class RelayDurableObject extends DurableObject<Env> {
         case 'CLOSE': this.handleClose(ws, parsed); break;
         default: ws.send(JSON.stringify(['NOTICE', 'unsupported message type']));
       }
+      this.scheduleMetricsFlush();
     } catch (error) {
       const messageText = error instanceof Error ? error.message : 'internal error';
       ws.send(JSON.stringify(['NOTICE', messageText]));
@@ -723,7 +782,6 @@ export class RelayDurableObject extends DurableObject<Env> {
 
   private accessContext(
     session: SessionAttachment,
-    cache?: { apps: Map<string, AppRecord | null>; users: Map<string, UserRecord | null> },
   ): { app: AppRecord | null; users: UserRecord[]; authenticatedPubkeys: string[] } {
     const now = Math.floor(Date.now() / 1000);
     const appSessionActive = !!session.app_id
@@ -735,60 +793,98 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
     let app: AppRecord | null = null;
     if (appSessionActive && session.app_id) {
-      if (!cache) {
-        app = this.getAppById(session.app_id);
-      } else {
-        if (!cache.apps.has(session.app_id)) cache.apps.set(session.app_id, this.getAppById(session.app_id));
-        app = cache.apps.get(session.app_id) ?? null;
-      }
+      if (!this.appCache.has(session.app_id)) this.appCache.set(session.app_id, this.getAppById(session.app_id));
+      app = this.appCache.get(session.app_id) ?? null;
     }
-    let users: UserRecord[];
-    if (!cache) {
-      users = this.getUsers(authenticatedPubkeys);
-    } else {
-      const missing = authenticatedPubkeys.filter(pubkey => !cache.users.has(pubkey));
-      if (missing.length) {
-        const found = new Map(this.getUsers(missing).map(user => [user.pubkey, user]));
-        for (const pubkey of missing) cache.users.set(pubkey, found.get(pubkey) ?? null);
-      }
-      users = authenticatedPubkeys.flatMap(pubkey => {
-        const user = cache.users.get(pubkey);
-        return user ? [user] : [];
-      });
+    // Expiry is evaluated by the policy at use time, so cached rows stay valid.
+    const missing = authenticatedPubkeys.filter(pubkey => !this.userCache.has(pubkey));
+    if (missing.length) {
+      // Any key can authenticate via NIP-42; bound the negative entries.
+      if (this.userCache.size + missing.length > MAX_CACHED_USERS) this.userCache.clear();
+      const found = new Map(this.getUsers(missing).map(user => [user.pubkey, user]));
+      for (const pubkey of missing) this.userCache.set(pubkey, found.get(pubkey) ?? null);
     }
+    const users = authenticatedPubkeys.flatMap(pubkey => {
+      const user = this.userCache.get(pubkey);
+      return user ? [user] : [];
+    });
     return { app, users, authenticatedPubkeys };
   }
 
-
   private recordRead(eventsReturned: number, denied: boolean): void {
-    const now = Math.floor(Date.now() / 1000);
-    this.sql.exec(
-      `UPDATE relay_metrics
-       SET read_requests = read_requests + 1,
-           read_events = read_events + ?,
-           read_denied = read_denied + ?,
-           last_read_at = ?
-       WHERE id = 1`,
-      Math.max(0, eventsReturned), denied ? 1 : 0, now,
-    );
+    const metrics = this.pendingMetrics;
+    metrics.read_requests += 1;
+    metrics.read_events += Math.max(0, eventsReturned);
+    if (denied) metrics.read_denied += 1;
+    metrics.last_read_at = Math.floor(Date.now() / 1000);
   }
 
   private recordWrite(accepted: boolean): void {
-    const now = Math.floor(Date.now() / 1000);
+    const metrics = this.pendingMetrics;
+    metrics.write_attempts += 1;
+    if (accepted) metrics.write_accepted += 1;
+    else metrics.write_denied += 1;
+    metrics.last_write_at = Math.floor(Date.now() / 1000);
+  }
+
+  /**
+   * Called after a message's replies are sent. The timer keeps the object
+   * awake for at most one delay, so a burst costs one write and counts
+   * survive the hibernation that follows it.
+   */
+  private scheduleMetricsFlush(): void {
+    if (this.metricsTimer || !this.hasPendingMetrics()) return;
+    this.metricsTimer = setTimeout(() => {
+      this.metricsTimer = null;
+      this.flushMetrics();
+    }, METRICS_FLUSH_DELAY_MS);
+  }
+
+  private hasPendingMetrics(): boolean {
+    const metrics = this.pendingMetrics;
+    return metrics.read_requests > 0 || metrics.write_attempts > 0;
+  }
+
+  private flushMetrics(): void {
+    if (!this.hasPendingMetrics()) return;
+    const metrics = this.pendingMetrics;
     this.sql.exec(
       `UPDATE relay_metrics
-       SET write_attempts = write_attempts + 1,
+       SET read_requests = read_requests + ?,
+           read_events = read_events + ?,
+           read_denied = read_denied + ?,
+           write_attempts = write_attempts + ?,
            write_accepted = write_accepted + ?,
            write_denied = write_denied + ?,
-           last_write_at = ?
+           last_read_at = COALESCE(?, last_read_at),
+           last_write_at = COALESCE(?, last_write_at)
        WHERE id = 1`,
-      accepted ? 1 : 0, accepted ? 0 : 1, now,
+      metrics.read_requests, metrics.read_events, metrics.read_denied,
+      metrics.write_attempts, metrics.write_accepted, metrics.write_denied,
+      metrics.last_read_at, metrics.last_write_at,
     );
+    this.pendingMetrics = emptyMetrics();
+    if (this.metricsTimer) {
+      clearTimeout(this.metricsTimer);
+      this.metricsTimer = null;
+    }
   }
 
   private getRelayStats(): Record<string, unknown> {
     const metricRows = this.sql.exec('SELECT * FROM relay_metrics WHERE id = 1').toArray() as SqlRow[];
-    const metrics = metricRows[0] ?? {};
+    const stored = metricRows[0] ?? {};
+    // Include the unflushed batch without writing it.
+    const pending = this.pendingMetrics;
+    const metrics = {
+      read_requests: Number(stored.read_requests ?? 0) + pending.read_requests,
+      read_events: Number(stored.read_events ?? 0) + pending.read_events,
+      read_denied: Number(stored.read_denied ?? 0) + pending.read_denied,
+      write_attempts: Number(stored.write_attempts ?? 0) + pending.write_attempts,
+      write_accepted: Number(stored.write_accepted ?? 0) + pending.write_accepted,
+      write_denied: Number(stored.write_denied ?? 0) + pending.write_denied,
+      last_read_at: pending.last_read_at ?? stored.last_read_at,
+      last_write_at: pending.last_write_at ?? stored.last_write_at,
+    };
     const count = (sql: string, ...bindings: SqlStorageValue[]) => {
       const rows = this.sql.exec(sql, ...bindings).toArray() as SqlRow[];
       return Number(rows[0]?.count ?? 0);
@@ -819,12 +915,12 @@ export class RelayDurableObject extends DurableObject<Env> {
       active_app_sessions: count('SELECT COUNT(*) AS count FROM app_sessions WHERE expires_at > ?', now),
       stored_events: count('SELECT COUNT(*) AS count FROM events'),
       database_bytes: this.sql.databaseSize,
-      read_requests: Number(metrics.read_requests ?? 0),
-      read_events: Number(metrics.read_events ?? 0),
-      read_denied: Number(metrics.read_denied ?? 0),
-      write_attempts: Number(metrics.write_attempts ?? 0),
-      write_accepted: Number(metrics.write_accepted ?? 0),
-      write_denied: Number(metrics.write_denied ?? 0),
+      read_requests: metrics.read_requests,
+      read_events: metrics.read_events,
+      read_denied: metrics.read_denied,
+      write_attempts: metrics.write_attempts,
+      write_accepted: metrics.write_accepted,
+      write_denied: metrics.write_denied,
       last_read_at: metrics.last_read_at === null || metrics.last_read_at === undefined ? null : Number(metrics.last_read_at),
       last_write_at: metrics.last_write_at === null || metrics.last_write_at === undefined ? null : Number(metrics.last_write_at),
       recent_writes: recentWrites,
@@ -865,13 +961,14 @@ export class RelayDurableObject extends DurableObject<Env> {
       return;
     }
 
-    const events = new Map<string, NostrEvent>();
+    const events = new Map<string, QueriedEvent>();
     for (const filter of typedFilters) {
       for (const event of this.queryFilter(filter, settings, ctx.authenticatedPubkeys)) events.set(event.id, event);
     }
     const ordered = [...events.values()].sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id));
     this.recordRead(ordered.length, false);
-    for (const event of ordered) ws.send(JSON.stringify(['EVENT', subId, event]));
+    const prefix = `["EVENT",${JSON.stringify(subId)},`;
+    for (const event of ordered) ws.send(`${prefix}${event.json}]`);
     ws.send(JSON.stringify(['EOSE', subId]));
     this.perfWindow.record('req', performance.now() - startedAt);
 
@@ -887,7 +984,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     this.saveSession(ws, session);
   }
 
-  private queryFilter(filter: NostrFilter, settings: RelaySettings, recipients: string[]): NostrEvent[] {
+  private queryFilter(filter: NostrFilter, settings: RelaySettings, recipients: string[]): QueriedEvent[] {
     const requested = filter.limit ?? settings.default_limit;
     const query = buildFilterQuery(filter, {
       limit: Math.max(0, Math.min(requested, settings.max_limit)),
@@ -901,7 +998,11 @@ export class RelayDurableObject extends DurableObject<Env> {
     const cursor = this.sql.exec(query.sql, ...query.bindings);
     const rows = cursor.toArray() as SqlRow[];
     this.perfWindow.record('query', performance.now() - startedAt, cursor.rowsRead);
-    return rows.map(eventFromRow);
+    return rows.map(row => ({
+      id: String(row.id),
+      created_at: Number(row.created_at),
+      json: storedEventJson(row as unknown as StoredEventRow),
+    }));
   }
 
   private async handleEvent(ws: WebSocket, msg: unknown[], bytes: number): Promise<void> {
@@ -914,7 +1015,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       ws.send(JSON.stringify(['OK', id, false, 'invalid: event message exceeds relay size limit']));
       return;
     }
-    if (!isValidEventShape(candidate) || !verifyEvent(candidate)) {
+    if (!isValidEventShape(candidate)) {
       this.recordWrite(false);
       ws.send(JSON.stringify(['OK', id, false, 'invalid: event id or signature is invalid']));
       return;
@@ -954,10 +1055,19 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
     this.saveSession(ws, session);
 
+    // Clients resend events they already published. Answer those before the
+    // schnorr check, which is the costliest step on this single thread. The
+    // policy check above keeps unauthorized clients from probing stored ids,
+    // and nothing is stored or broadcast on this path.
     const existing = this.sql.exec('SELECT id FROM events WHERE id = ? LIMIT 1', event.id).toArray();
     if (existing.length) {
       this.recordWrite(true);
       ws.send(JSON.stringify(['OK', event.id, true, 'duplicate: already stored']));
+      return;
+    }
+    if (!verifyEvent(event)) {
+      this.recordWrite(false);
+      ws.send(JSON.stringify(['OK', event.id, false, 'invalid: event id or signature is invalid']));
       return;
     }
 
@@ -967,6 +1077,8 @@ export class RelayDurableObject extends DurableObject<Env> {
       const stored = this.ctx.storage.transactionSync(() => {
         const inserted = this.storeEvent(event, expiration);
         if (inserted && event.kind === 5) this.applyDeletion(event);
+        // Ride along with this write: no extra output-gate wait.
+        this.flushMetrics();
         return inserted;
       });
       if (!stored) {
@@ -1044,12 +1156,7 @@ export class RelayDurableObject extends DurableObject<Env> {
   private broadcast(event: NostrEvent): void {
     const settings = this.getSettings();
     const now = Math.floor(Date.now() / 1000);
-    // Each broadcast is synchronous: memoization is valid only for this event
-    // and never survives policy edits or Durable Object hibernation.
-    const accessCache = {
-      apps: new Map<string, AppRecord | null>(),
-      users: new Map<string, UserRecord | null>(),
-    };
+    const json = eventJson(event);
     for (const socket of this.ctx.getWebSockets()) {
       const session = socket.deserializeAttachment() as SessionAttachment | null;
       if (!session || !sessionMayReceiveGiftWrap(event, session, now)) continue;
@@ -1057,14 +1164,14 @@ export class RelayDurableObject extends DurableObject<Env> {
       if (!matching.length) continue;
       // Read access was checked at REQ time. App sessions expire and admins can
       // disable apps or users since then, so re-check before every live delivery.
-      const ctx = this.accessContext(session, accessCache);
+      const ctx = this.accessContext(session);
       if (!giftWrapVisible(event, ctx.authenticatedPubkeys)) continue;
       let revoked = false;
       for (const [subId, filters] of matching) {
         const decision = evaluateRead(settings, ctx, filters);
         try {
           if (decision.allowed) {
-            socket.send(JSON.stringify(['EVENT', subId, event]));
+            socket.send(`["EVENT",${JSON.stringify(subId)},${json}]`);
           } else {
             delete session.subscriptions[subId];
             revoked = true;
@@ -1089,30 +1196,30 @@ export class RelayDurableObject extends DurableObject<Env> {
       if (request.method === 'PUT' && url.pathname === '/api/admin/settings') {
         const body = await request.json() as Record<string, unknown>;
         this.updateSettings(body);
-        this.disconnectAll('relay policy changed');
+        this.accessChanged('relay policy changed');
         return json({ ok: true });
       }
       if (request.method === 'POST' && url.pathname === '/api/admin/apps') {
         const result = await this.createApp(await request.json() as Record<string, unknown>);
-        this.disconnectAll('application access list changed');
+        this.accessChanged('application access list changed');
         return json(result, 201);
       }
       if (request.method === 'DELETE' && url.pathname.startsWith('/api/admin/apps/')) {
         const id = decodeURIComponent(url.pathname.slice('/api/admin/apps/'.length));
         this.sql.exec('DELETE FROM applications WHERE id = ?', id);
-        this.disconnectAll('application access list changed');
+        this.accessChanged('application access list changed');
         return json({ ok: true });
       }
       if (request.method === 'POST' && url.pathname === '/api/admin/users') {
         const result = this.createUser(await request.json() as Record<string, unknown>);
-        this.disconnectAll('user access list changed');
+        this.accessChanged('user access list changed');
         return json(result, 201);
       }
       if (request.method === 'DELETE' && url.pathname.startsWith('/api/admin/users/')) {
         const pubkey = normalizePubkey(decodeURIComponent(url.pathname.slice('/api/admin/users/'.length)));
         if (!pubkey) return json({ error: 'invalid pubkey' }, 400);
         this.sql.exec('DELETE FROM users WHERE pubkey = ?', pubkey);
-        this.disconnectAll('user access list changed');
+        this.accessChanged('user access list changed');
         return json({ ok: true });
       }
       return json({ error: 'not found' }, 404);
@@ -1199,7 +1306,11 @@ export class RelayDurableObject extends DurableObject<Env> {
     return { user };
   }
 
-  private disconnectAll(reason: string): void {
+  /** Drops cached policy rows and every socket after an admin change. */
+  private accessChanged(reason: string): void {
+    this.settingsCache = null;
+    this.appCache.clear();
+    this.userCache.clear();
     for (const socket of this.ctx.getWebSockets()) {
       try { socket.close(1012, reason); } catch { /* disconnected */ }
     }
