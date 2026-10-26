@@ -17,6 +17,8 @@ export type QueryOptions = {
   recipients: string[];
   /** event_tags.created_at is filled for every row, so tag queries can walk its index. */
   tagIndexReady: boolean;
+  /** Enabled only after the legacy event_tags.received_at backfill completes. */
+  recipientTimeIndexReady?: boolean;
 };
 
 /**
@@ -72,10 +74,24 @@ export function buildFilterQuery(filter: NostrFilter, options: QueryOptions): Fi
   // received_since reads only what arrived since then, across the whole
   // relay, which is far fewer rows than one recipient's backdating window.
   const byReceipt = filter.received_since !== undefined;
-  const driver = options.tagIndexReady && !byReceipt ? tags.find(([, values]) => values.length === 1) : undefined;
+  // Restrict the recipient index fast path to one authenticated #p target.
+  // Keep the global arrival-time index for untrusted/multi-recipient queries.
+  const receiptRecipient = byReceipt && options.recipientTimeIndexReady
+    ? tags.find(([name, values]) => name === 'p'
+        && values.length === 1 && options.recipients.includes(values[0]))
+    : undefined;
+  const driver = receiptRecipient || (options.tagIndexReady && !byReceipt
+    ? tags.find(([, values]) => values.length === 1) : undefined);
   let from = 'events e';
   let order = 'e.created_at DESC, e.id ASC';
-  if (byReceipt) {
+  if (receiptRecipient) {
+    from = 'event_tags t INDEXED BY event_tags_received_time_idx CROSS JOIN events e ON e.id = t.event_id';
+    order = 't.received_at DESC, t.event_id ASC';
+    where.push('t.name = ?', 't.value = ?', 't.received_at >= ?');
+    bindings.push(receiptRecipient[0], receiptRecipient[1][0], filter.received_since!);
+    if (filter.since !== undefined) { where.push('e.created_at >= ?'); bindings.push(filter.since); }
+    if (filter.until !== undefined) { where.push('e.created_at <= ?'); bindings.push(filter.until); }
+  } else if (byReceipt) {
     from = 'events e INDEXED BY events_received_at_idx';
     order = 'e.received_at DESC, e.id ASC';
     where.push('e.received_at >= ?');
