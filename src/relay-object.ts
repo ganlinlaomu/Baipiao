@@ -18,6 +18,7 @@ import {
   verifyEvent,
 } from './nostr';
 import { evaluateRead, evaluateWrite } from './policy';
+import { allowControlMessage, MAX_RELAY_FRAME_CHARS, MAX_CONTROL_FRAME_CHARS } from './controlLimits';
 import { buildFilterQuery, EXPIRED_EVENTS_BATCH_SQL, giftWrapVisible } from './query';
 import type {
   AppRecord,
@@ -558,10 +559,34 @@ export class RelayDurableObject extends DurableObject<Env> {
         ws.send(JSON.stringify(['NOTICE', 'binary messages are not supported']));
         return;
       }
+      // Reject oversized input before JSON.parse allocates a large object. The
+      // configured EVENT byte limit is still enforced by handleEvent().
+      if (message.length > MAX_RELAY_FRAME_CHARS) {
+        ws.close(1009, 'message too large');
+        return;
+      }
       const parsed = JSON.parse(message);
       if (!Array.isArray(parsed) || typeof parsed[0] !== 'string') {
         ws.send(JSON.stringify(['NOTICE', 'invalid message']));
         return;
+      }
+
+      if (parsed[0] !== 'EVENT' && message.length > MAX_CONTROL_FRAME_CHARS) {
+        ws.close(1009, 'control message too large');
+        return;
+      }
+      if (parsed[0] === 'AUTH' || parsed[0] === 'REQ') {
+        const session = this.session(ws);
+        if (!allowControlMessage(session, parsed[0])) {
+          if (parsed[0] === 'REQ' && typeof parsed[1] === 'string') {
+            ws.send(JSON.stringify(['CLOSED', parsed[1], 'rate-limited: too many subscriptions']));
+          } else {
+            ws.send(JSON.stringify(['NOTICE', 'rate-limited: too many authentication attempts']));
+          }
+          this.saveSession(ws, session);
+          return;
+        }
+        this.saveSession(ws, session);
       }
 
       switch (parsed[0]) {
@@ -844,13 +869,18 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
 
     if (!isEphemeralKind(event.kind)) {
-      const stored = this.storeEvent(event, expiration);
+      // Replace/delete and insert must commit atomically. An exception must
+      // never leave the prior valid replaceable event deleted.
+      const stored = this.ctx.storage.transactionSync(() => {
+        const inserted = this.storeEvent(event, expiration);
+        if (inserted && event.kind === 5) this.applyDeletion(event);
+        return inserted;
+      });
       if (!stored) {
         this.recordWrite(true);
         ws.send(JSON.stringify(['OK', event.id, true, 'duplicate: newer replaceable event already stored']));
         return;
       }
-      if (event.kind === 5) this.applyDeletion(event);
     }
 
     this.recordWrite(true);
@@ -887,16 +917,14 @@ export class RelayDurableObject extends DurableObject<Env> {
       }
     }
 
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec(
+    this.sql.exec(
         'INSERT INTO events(id,pubkey,created_at,received_at,kind,d_tag,content,sig,tags_json,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
         event.id, event.pubkey, event.created_at, receivedAt, event.kind, isParameterizedReplaceableKind(event.kind) ? dTag : '', event.content, event.sig, JSON.stringify(event.tags), expiresAt,
       );
-      for (const tag of event.tags) {
-        if (tag.length < 2 || tag[0].length !== 1 || !/^[A-Za-z]$/.test(tag[0])) continue;
-        this.sql.exec('INSERT OR IGNORE INTO event_tags(event_id,name,value,created_at) VALUES(?,?,?,?)', event.id, tag[0], tag[1], event.created_at);
-      }
-    });
+    for (const tag of event.tags) {
+      if (tag.length < 2 || tag[0].length !== 1 || !/^[A-Za-z]$/.test(tag[0])) continue;
+      this.sql.exec('INSERT OR IGNORE INTO event_tags(event_id,name,value,created_at) VALUES(?,?,?,?)', event.id, tag[0], tag[1], event.created_at);
+    }
     return true;
   }
 

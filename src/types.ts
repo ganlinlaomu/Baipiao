@@ -84,6 +84,8 @@ export interface SessionAttachment {
   subscriptions: Record<string, NostrFilter[]>;
   rate_window_started_at: number;
   rate_count: number;
+  /** REQ/AUTH limits survive Durable Object WebSocket hibernation. */
+  control_windows?: Partial<Record<'REQ' | 'AUTH', { startedAt: number; count: number }>>;
 }
 
 export interface AccessDecision {
