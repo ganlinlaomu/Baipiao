@@ -49,6 +49,10 @@ const APP_TYPES = new Set(['web', 'native', 'service']);
 const encoder = new TextEncoder();
 const MAX_APP_SESSION_TTL = 24 * 60 * 60;
 const TAG_BACKFILL_BATCH = 2000;
+// Keep new one-time index backfill comfortably below Workers Free daily
+// SQLite row-write limits; the original tag-created_at backfill is unchanged.
+const RECEIVED_TAG_BACKFILL_BATCH = 48;
+const RECEIVED_TAG_BACKFILL_DELAY_MS = 2 * 60_000;
 const TAG_BACKFILL_DELAY_MS = 10_000;
 const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60_000;
 const EXPIRED_PURGE_BATCH = 500;
@@ -314,7 +318,7 @@ export class RelayDurableObject extends DurableObject<Env> {
       return;
     }
     if (!this.recipientTimeIndexReady && !this.backfillRecipientReceivedTimes()) {
-      await this.ctx.storage.setAlarm(Date.now() + TAG_BACKFILL_DELAY_MS);
+      await this.ctx.storage.setAlarm(Date.now() + RECEIVED_TAG_BACKFILL_DELAY_MS);
       return;
     }
     const more = this.purgeExpired();
@@ -383,7 +387,7 @@ export class RelayDurableObject extends DurableObject<Env> {
     }
     const until = Number(marker);
     const cursor = Number(this.getMeta('received_tag_backfill_cursor') ?? 0);
-    const next = Math.min(until, cursor + TAG_BACKFILL_BATCH);
+    const next = Math.min(until, cursor + RECEIVED_TAG_BACKFILL_BATCH);
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(
         `UPDATE event_tags SET received_at = (SELECT e.received_at FROM events e WHERE e.id = event_tags.event_id)
